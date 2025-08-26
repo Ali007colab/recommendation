@@ -1,25 +1,29 @@
+#!/usr/bin/env python3
+
 import logging
+import sys
+import os
 from fastapi import FastAPI, Depends, HTTPException
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 import numpy as np
 from sentence_transformers import SentenceTransformer
-from sklearn.metrics.pairwise import cosine_similarity
 import faiss
-import redis
-import json
-from datetime import datetime, timedelta
+from datetime import datetime
+
+# إضافة المجلد الحالي للمسار
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from config import config
 from database import get_db, create_tables, Coupon, Category, CouponType, UserInteraction
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Recommendation Service", version="1.0.0")
 
-model = SentenceTransformer(config.MODEL_NAME)
-redis_client = redis.from_url(config.REDIS_URL)
+# متغيرات عامة
+model = None
 faiss_index = None
 coupon_ids = []
 vector_dim = config.VECTOR_DIM
@@ -33,18 +37,61 @@ def build_enhanced_text(coupon, category, coupon_type):
     
     return f"{category_tokens}{type_tokens}{name_emphasis} {description_reduced} {price_range}"
 
+def initialize_model():
+    global model
+    try:
+        logger.info("Loading sentence transformer model...")
+        model = SentenceTransformer(config.MODEL_NAME)
+        logger.info("Model loaded successfully!")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to load model: {e}")
+        return False
+
 @app.on_event("startup")
 async def startup_event():
-    create_tables()
-    logger.info("Recommendation Service started")
+    logger.info("Starting Recommendation Service...")
+    
+    # إنشاء الجداول
+    try:
+        create_tables()
+        logger.info("Database tables created/verified")
+    except Exception as e:
+        logger.error(f"Database error: {e}")
+    
+    # تحميل المودل
+    if not initialize_model():
+        logger.error("Failed to initialize model")
+    
+    logger.info("Recommendation Service startup completed")
+
+@app.get("/")
+def root():
+    return {
+        "service": "Recommendation Service",
+        "version": "1.0.0",
+        "status": "running",
+        "model_loaded": model is not None,
+        "vector_store_built": faiss_index is not None
+    }
+
+@app.get("/health")
+def health_check():
+    return {
+        "status": "healthy",
+        "timestamp": datetime.utcnow(),
+        "model_status": "loaded" if model else "not_loaded",
+        "vector_store_status": "built" if faiss_index else "not_built"
+    }
 
 @app.post("/build_vector_store")
 def build_vector_store(db: Session = Depends(get_db)):
     global faiss_index, coupon_ids
     
-    cache_key = "vector_store_built"
-    if redis_client.get(cache_key):
-        return {"message": "Vector store already built (cached)"}
+    if model is None:
+        raise HTTPException(status_code=500, detail="Model not loaded")
+    
+    logger.info("Building vector store...")
     
     coupons = db.query(Coupon).all()
     if not coupons:
@@ -60,13 +107,14 @@ def build_vector_store(db: Session = Depends(get_db)):
         texts.append(text)
         coupon_ids.append(coupon.id)
     
+    logger.info(f"Encoding {len(texts)} texts...")
     embeddings = model.encode(texts)
     
+    logger.info("Building FAISS index...")
     faiss_index = faiss.IndexFlatIP(vector_dim)
     faiss_index.add(embeddings.astype('float32'))
     
-    redis_client.setex(cache_key, 3600, "true")
-    
+    logger.info(f"Vector store built with {len(coupons)} coupons")
     return {"message": f"Vector store built with {len(coupons)} coupons"}
 
 @app.post("/log_event")
@@ -83,20 +131,15 @@ def log_event(user_id: int, coupon_id: int, action: str, db: Session = Depends(g
     db.add(interaction)
     db.commit()
     
-    cache_key = f"user_profile_{user_id}"
-    redis_client.delete(cache_key)
-    
-    return {"message": "Event logged successfully"}
+    return {"message": "Event logged successfully", "score": score}
 
 @app.get("/get_recommendations")
 def get_recommendations(user_id: int, top_n: int = 10, db: Session = Depends(get_db)):
     if faiss_index is None:
-        raise HTTPException(status_code=500, detail="Vector store not built")
+        raise HTTPException(status_code=500, detail="Vector store not built. Call /build_vector_store first")
     
-    cache_key = f"recommendations_{user_id}_{top_n}"
-    cached = redis_client.get(cache_key)
-    if cached:
-        return json.loads(cached)
+    if model is None:
+        raise HTTPException(status_code=500, detail="Model not loaded")
     
     interactions = db.query(UserInteraction).filter(UserInteraction.user_id == user_id).all()
     
@@ -105,9 +148,7 @@ def get_recommendations(user_id: int, top_n: int = 10, db: Session = Depends(get
                            .group_by(UserInteraction.coupon_id)\
                            .order_by(func.sum(UserInteraction.score).desc())\
                            .limit(top_n).all()
-        result = {"recommendations": [c.coupon_id for c in popular_coupons], "method": "popular"}
-        redis_client.setex(cache_key, 300, json.dumps(result))
-        return result
+        return {"recommendations": [c.coupon_id for c in popular_coupons], "method": "popular"}
     
     weighted_emb = np.zeros(vector_dim)
     total_weight = 0
@@ -175,15 +216,17 @@ def get_recommendations(user_id: int, top_n: int = 10, db: Session = Depends(get
             if coupon_id not in seen_coupons and coupon_id not in recommendations:
                 recommendations.append(coupon_id)
     
-    result = {
+    return {
         "recommendations": recommendations[:top_n],
         "method": "content_based",
         "user_categories": user_categories
     }
-    
-    redis_client.setex(cache_key, 300, json.dumps(result))
-    return result
 
-@app.get("/health")
-def health_check():
-    return {"status": "healthy", "timestamp": datetime.utcnow()}
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(
+        app,
+        host=config.SERVICE_HOST,
+        port=config.SERVICE_PORT,
+        log_level="info"
+    )
