@@ -11,7 +11,6 @@ from sentence_transformers import SentenceTransformer
 import faiss
 from datetime import datetime
 
-# إضافة المجلد الحالي للمسار
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from config import config
@@ -22,7 +21,6 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Recommendation Service", version="1.0.0")
 
-# متغيرات عامة
 model = None
 faiss_index = None
 coupon_ids = []
@@ -37,42 +35,34 @@ def build_enhanced_text(coupon, category, coupon_type):
     
     return f"{category_tokens}{type_tokens}{name_emphasis} {description_reduced} {price_range}"
 
-def initialize_model():
-    global model
-    try:
-        logger.info("Loading sentence transformer model...")
-        model = SentenceTransformer(config.MODEL_NAME)
-        logger.info("Model loaded successfully!")
-        return True
-    except Exception as e:
-        logger.error(f"Failed to load model: {e}")
-        return False
-
 @app.on_event("startup")
 async def startup_event():
-    logger.info("Starting Recommendation Service...")
+    global model
+    logger.info("🚀 Starting Recommendation Service...")
     
-    # إنشاء الجداول
     try:
         create_tables()
-        logger.info("Database tables created/verified")
+        logger.info("✅ Database ready")
     except Exception as e:
-        logger.error(f"Database error: {e}")
+        logger.error(f"❌ Database error: {e}")
     
-    # تحميل المودل
-    if not initialize_model():
-        logger.error("Failed to initialize model")
+    try:
+        logger.info("📥 Loading sentence transformer model...")
+        model = SentenceTransformer(config.MODEL_NAME)
+        logger.info("✅ Model loaded successfully!")
+    except Exception as e:
+        logger.error(f"❌ Model loading failed: {e}")
     
-    logger.info("Recommendation Service startup completed")
+    logger.info("✅ Service started")
 
 @app.get("/")
 def root():
     return {
         "service": "Recommendation Service",
         "version": "1.0.0",
-        "status": "running",
-        "model_loaded": model is not None,
-        "vector_store_built": faiss_index is not None
+        "status": "🟢 running",
+        "model_loaded": "✅" if model else "❌",
+        "vector_store_built": "✅" if faiss_index else "❌"
     }
 
 @app.get("/health")
@@ -91,7 +81,7 @@ def build_vector_store(db: Session = Depends(get_db)):
     if model is None:
         raise HTTPException(status_code=500, detail="Model not loaded")
     
-    logger.info("Building vector store...")
+    logger.info("🔨 Building vector store...")
     
     coupons = db.query(Coupon).all()
     if not coupons:
@@ -107,14 +97,14 @@ def build_vector_store(db: Session = Depends(get_db)):
         texts.append(text)
         coupon_ids.append(coupon.id)
     
-    logger.info(f"Encoding {len(texts)} texts...")
+    logger.info(f"📊 Encoding {len(texts)} texts...")
     embeddings = model.encode(texts)
     
-    logger.info("Building FAISS index...")
+    logger.info("🏗️ Building FAISS index...")
     faiss_index = faiss.IndexFlatIP(vector_dim)
     faiss_index.add(embeddings.astype('float32'))
     
-    logger.info(f"Vector store built with {len(coupons)} coupons")
+    logger.info(f"✅ Vector store built with {len(coupons)} coupons")
     return {"message": f"Vector store built with {len(coupons)} coupons"}
 
 @app.post("/log_event")
@@ -136,7 +126,7 @@ def log_event(user_id: int, coupon_id: int, action: str, db: Session = Depends(g
 @app.get("/get_recommendations")
 def get_recommendations(user_id: int, top_n: int = 10, db: Session = Depends(get_db)):
     if faiss_index is None:
-        raise HTTPException(status_code=500, detail="Vector store not built. Call /build_vector_store first")
+        raise HTTPException(status_code=500, detail="Vector store not built")
     
     if model is None:
         raise HTTPException(status_code=500, detail="Model not loaded")
