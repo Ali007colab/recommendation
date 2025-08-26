@@ -1,18 +1,93 @@
 #!/usr/bin/env python3
 
-import psycopg2
+import sqlite3
 import random
 from datetime import datetime, timedelta
 import string
 
-# إعداد الاتصال
+# إعداد قاعدة بيانات SQLite
 def get_connection():
-    return psycopg2.connect(
-        host='localhost',
-        database='recommendation_db',
-        user='recommendation_user',
-        password=''
-    )
+    conn = sqlite3.connect('recommendation.db')
+    return conn
+
+def create_tables():
+    """إنشاء الجداول في SQLite"""
+    conn = get_connection()
+    cur = conn.cursor()
+    
+    # إنشاء الجداول
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS categories (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL UNIQUE
+        )
+    ''')
+    
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS coupon_types (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            description TEXT
+        )
+    ''')
+    
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS coupons (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            description TEXT,
+            price REAL NOT NULL,
+            coupon_type_id INTEGER,
+            category_id INTEGER,
+            provider_id INTEGER NOT NULL,
+            coupon_status INTEGER DEFAULT 1,
+            coupon_code TEXT,
+            date TEXT DEFAULT CURRENT_DATE,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (coupon_type_id) REFERENCES coupon_types(id),
+            FOREIGN KEY (category_id) REFERENCES categories(id)
+        )
+    ''')
+    
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS user_interactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            coupon_id INTEGER,
+            action TEXT NOT NULL,
+            score REAL NOT NULL,
+            timestamp TEXT DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (coupon_id) REFERENCES coupons(id)
+        )
+    ''')
+    
+    # إدراج البيانات الأساسية
+    categories = [
+        (1, 'Electronics'), (2, 'Food'), (3, 'Fashion'), (4, 'Travel'), (5, 'Entertainment'),
+        (6, 'Health & Beauty'), (7, 'Sports & Fitness'), (8, 'Books & Education'), 
+        (9, 'Home & Garden'), (10, 'Automotive')
+    ]
+    
+    coupon_types = [
+        (1, 'Discount', 'Percentage discount on single item'),
+        (2, 'Bundle Deal', 'Special pricing for multiple items'),
+        (3, 'Free Shipping', 'Free shipping on orders'),
+        (4, 'Buy One Get One', 'Buy one item, get another free'),
+        (5, 'Cashback', 'Get cashback on purchase'),
+        (6, 'Flash Sale', 'Limited time discount offer'),
+        (7, 'Loyalty Reward', 'Reward for loyal customers'),
+        (8, 'First Time Buyer', 'Special offer for new customers'),
+        (9, 'Seasonal Sale', 'Seasonal discount promotion'),
+        (10, 'Bulk Purchase', 'Discount for buying in bulk')
+    ]
+    
+    cur.executemany('INSERT OR IGNORE INTO categories VALUES (?, ?)', categories)
+    cur.executemany('INSERT OR IGNORE INTO coupon_types VALUES (?, ?, ?)', coupon_types)
+    
+    conn.commit()
+    cur.close()
+    conn.close()
 
 # بيانات أساسية للتوليد
 CATEGORIES = [
@@ -257,7 +332,7 @@ def populate_coupons(num_coupons=6000):
             cur.execute("""
                 INSERT INTO coupons (name, description, price, coupon_type_id, category_id, 
                                    provider_id, coupon_status, coupon_code, date)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (name, description, price, coupon_type_id, category_id, 
                   random.randint(1, 100), 1, coupon_code, end_date.date()))
             
@@ -400,7 +475,7 @@ def populate_interactions(num_interactions=6000):
                 
                 cur.execute("""
                     INSERT INTO user_interactions (user_id, coupon_id, action, score, timestamp)
-                    VALUES (%s, %s, %s, %s, %s)
+                    VALUES (?, ?, ?, ?, ?)
                 """, (user_id, coupon_id, action, score, timestamp))
                 
                 interactions_added += 1
@@ -432,18 +507,18 @@ def create_test_scenarios():
     for coupon_id in electronics_coupons[:3]:
         cur.execute("""
             INSERT INTO user_interactions (user_id, coupon_id, action, score, timestamp)
-            VALUES (%s, %s, %s, %s, %s)
+            VALUES (?, ?, ?, ?, ?)
         """, (test_user_1, coupon_id, 'search', 2.0, datetime.now()))
         
         cur.execute("""
             INSERT INTO user_interactions (user_id, coupon_id, action, score, timestamp)
-            VALUES (%s, %s, %s, %s, %s)
+            VALUES (?, ?, ?, ?, ?)
         """, (test_user_1, coupon_id, 'click', 5.0, datetime.now()))
     
     # شراء واحد
     cur.execute("""
         INSERT INTO user_interactions (user_id, coupon_id, action, score, timestamp)
-        VALUES (%s, %s, %s, %s, %s)
+        VALUES (?, ?, ?, ?, ?)
     """, (test_user_1, electronics_coupons[0], 'purchase', 15.0, datetime.now()))
     
     # سيناريو 2: مستخدم محب للطعام
@@ -454,7 +529,7 @@ def create_test_scenarios():
     for coupon_id in food_coupons[:4]:
         cur.execute("""
             INSERT INTO user_interactions (user_id, coupon_id, action, score, timestamp)
-            VALUES (%s, %s, %s, %s, %s)
+            VALUES (?, ?, ?, ?, ?)
         """, (test_user_2, coupon_id, 'purchase', 15.0, datetime.now()))
     
     conn.commit()
@@ -531,8 +606,10 @@ def print_statistics():
 
 def main():
     """الدالة الرئيسية"""
-    print("🚀 Starting Large Data Population for PostgreSQL")
+    print("🚀 Starting Large Data Population with SQLite")
     print("=" * 60)
+    
+    create_tables()
     
     try:
         # مسح البيانات القديمة
