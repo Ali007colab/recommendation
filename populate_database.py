@@ -1,15 +1,17 @@
-import mysql.connector
+#!/usr/bin/env python3
+
+import psycopg2
 import random
 from datetime import datetime, timedelta
 import string
 
-# إعداد الاتصال بقاعدة البيانات
-def get_db_connection():
-    return mysql.connector.connect(
+# إعداد الاتصال
+def get_connection():
+    return psycopg2.connect(
         host='localhost',
-        user='root',
-        password='',  # أو كلمة المرور الخاصة بك
-        database='recommendation_db'
+        database='recommendation_db',
+        user='recommendation_user',
+        password=''
     )
 
 # بيانات أساسية للتوليد
@@ -27,551 +29,535 @@ CATEGORIES = [
 ]
 
 COUPON_TYPES = [
-    {'id': 1, 'name': 'Discount', 'description': 'Percentage discount on single item'},
-    {'id': 2, 'name': 'Bundle Deal', 'description': 'Special pricing for multiple items'},
-    {'id': 3, 'name': 'Free Shipping', 'description': 'Free shipping on orders'},
-    {'id': 4, 'name': 'Buy One Get One', 'description': 'Buy one item, get another free'},
-    {'id': 5, 'name': 'Cashback', 'description': 'Get cashback on purchase'},
-    {'id': 6, 'name': 'Flash Sale', 'description': 'Limited time discount offer'},
-    {'id': 7, 'name': 'Loyalty Reward', 'description': 'Reward for loyal customers'},
-    {'id': 8, 'name': 'First Time Buyer', 'description': 'Special offer for new customers'},
-    {'id': 9, 'name': 'Seasonal Sale', 'description': 'Seasonal discount promotion'},
-    {'id': 10, 'name': 'Bulk Purchase', 'description': 'Discount for buying in bulk'}
+    {'id': 1, 'name': 'Discount'},
+    {'id': 2, 'name': 'Bundle Deal'},
+    {'id': 3, 'name': 'Free Shipping'},
+    {'id': 4, 'name': 'Buy One Get One'},
+    {'id': 5, 'name': 'Cashback'},
+    {'id': 6, 'name': 'Flash Sale'},
+    {'id': 7, 'name': 'Loyalty Reward'},
+    {'id': 8, 'name': 'First Time Buyer'},
+    {'id': 9, 'name': 'Seasonal Sale'},
+    {'id': 10, 'name': 'Bulk Purchase'}
 ]
 
-
+# قوالب أسماء الكوبونات حسب الفئة
 COUPON_TEMPLATES = {
     'Electronics': [
-        'Gaming Laptop {discount}% Off',
-        'Smartphone Bundle Deal',
-        'Wireless Headphones Sale',
-        'Smart TV Cashback Offer',
-        'Tablet Flash Sale',
-        'Camera Equipment Discount',
-        'Smart Watch Special Deal',
-        'Gaming Console Bundle',
-        'Laptop Accessories Deal',
-        'Phone Case Bulk Buy',
-        'Bluetooth Speaker Sale',
-        'Smartwatch Flash Deal',
-        'Gaming Mouse Discount',
-        'Wireless Charger Bundle',
-        'VR Headset Special Offer'
+        '{percent}% Off {product}', 'Buy {product} Get Free {accessory}', 
+        '{product} Flash Sale', 'Premium {product} Bundle', '{product} Cashback Deal',
+        'Limited {product} Offer', '{product} Student Discount', 'Refurbished {product} Sale'
     ],
     'Food': [
-        'Pizza {discount}% Off',
-        'Burger Combo Deal',
-        'Healthy Food Bundle',
-        'Restaurant Cashback',
-        'Fast Food Flash Sale',
-        'Organic Products Discount',
-        'Beverage Special Offer',
-        'Dessert Bundle Deal',
-        'Breakfast Combo Sale',
-        'Dinner Package Discount',
-        'Coffee Shop Bundle',
-        'Ice Cream Flash Sale',
-        'Sandwich Combo Deal',
-        'Juice Bar Special',
-        'Bakery Items Discount'
+        '{percent}% Off {item}', 'Free Delivery on {item}', '{item} Combo Deal',
+        'Buy 2 Get 1 {item}', '{item} Happy Hour', 'Family {item} Pack',
+        '{item} Weekend Special', 'Healthy {item} Options'
     ],
     'Fashion': [
-        'Designer Clothes {discount}% Off',
-        'Shoes Bundle Deal',
-        'Summer Collection Sale',
-        'Accessories Cashback',
-        'Fashion Flash Sale',
-        'Winter Wear Discount',
-        'Jewelry Special Offer',
-        'Handbag Bundle Deal',
-        'Sportswear Sale',
-        'Formal Wear Discount',
-        'Sunglasses Flash Deal',
-        'Watch Collection Sale',
-        'Belt and Wallet Bundle',
-        'Scarf Special Offer',
-        'Hat Collection Discount'
+        '{percent}% Off {item}', 'Designer {item} Sale', '{item} Collection',
+        'Buy 2 Get 1 {item}', 'Seasonal {item} Clearance', 'Premium {item} Deal',
+        '{item} Fashion Week', 'Vintage {item} Sale'
     ],
     'Travel': [
-        'Flight Tickets {discount}% Off',
-        'Hotel Stay Bundle',
-        'Vacation Package Deal',
-        'Car Rental Cashback',
-        'Travel Insurance Sale',
-        'Cruise Discount',
-        'Adventure Tour Special',
-        'City Break Bundle',
-        'Beach Resort Deal',
-        'Mountain Trip Discount',
-        'Bus Ticket Flash Sale',
-        'Train Journey Bundle',
-        'Airport Transfer Deal',
-        'Travel Gear Special',
-        'Luggage Discount Offer'
+        '{percent}% Off {destination}', 'Free {service} with Booking', '{destination} Package',
+        'Last Minute {destination}', '{destination} Adventure', 'Luxury {destination} Deal',
+        '{destination} Family Package', 'Business {destination} Travel'
     ],
     'Entertainment': [
-        'Movie Tickets {discount}% Off',
-        'Concert Bundle Deal',
-        'Gaming Subscription Sale',
-        'Streaming Service Cashback',
-        'Theme Park Flash Sale',
-        'Sports Event Discount',
-        'Theater Show Special',
-        'Music Festival Bundle',
-        'Comedy Show Deal',
-        'Art Exhibition Discount',
-        'Bowling Night Special',
-        'Karaoke Bundle Deal',
-        'Arcade Games Flash Sale',
-        'Mini Golf Discount',
-        'Escape Room Special'
+        '{percent}% Off {event}', 'Free Popcorn with {event}', '{event} VIP Experience',
+        'Group {event} Discount', '{event} Season Pass', 'Premium {event} Access',
+        '{event} Student Deal', 'Weekend {event} Special'
     ],
     'Health & Beauty': [
-        'Skincare {discount}% Off',
-        'Makeup Bundle Deal',
-        'Spa Treatment Sale',
-        'Fitness Supplement Cashback',
-        'Beauty Products Flash Sale',
-        'Wellness Package Discount',
-        'Cosmetics Special Offer',
-        'Hair Care Bundle',
-        'Perfume Sale',
-        'Health Check Discount',
-        'Massage Therapy Special',
-        'Nail Care Bundle',
-        'Anti-aging Flash Sale',
-        'Vitamin Supplement Deal',
-        'Aromatherapy Discount'
+        '{percent}% Off {product}', 'Free {service} with {product}', '{product} Spa Package',
+        'Organic {product} Deal', '{product} Wellness Bundle', 'Professional {product} Treatment',
+        '{product} Beauty Box', 'Natural {product} Collection'
     ],
     'Sports & Fitness': [
-        'Gym Membership {discount}% Off',
-        'Sports Equipment Bundle',
-        'Fitness Gear Sale',
-        'Protein Supplement Cashback',
-        'Workout Clothes Flash Sale',
-        'Sports Shoes Discount',
-        'Fitness Class Special',
-        'Athletic Wear Bundle',
-        'Exercise Equipment Deal',
-        'Sports Nutrition Discount',
-        'Yoga Mat Flash Sale',
-        'Swimming Gear Bundle',
-        'Running Shoes Special',
-        'Fitness Tracker Deal',
-        'Sports Drink Discount'
+        '{percent}% Off {equipment}', 'Free Training with {equipment}', '{equipment} Pro Package',
+        '{equipment} Beginner Set', '{equipment} Championship Deal', 'Premium {equipment} Bundle',
+        '{equipment} Team Discount', 'Fitness {equipment} Challenge'
     ],
     'Books & Education': [
-        'Textbooks {discount}% Off',
-        'Online Course Bundle',
-        'Educational Software Sale',
-        'Book Collection Cashback',
-        'E-learning Flash Sale',
-        'Academic Materials Discount',
-        'Professional Course Special',
-        'Study Guide Bundle',
-        'Educational Toys Deal',
-        'Language Learning Discount',
-        'Digital Library Access',
-        'Certification Course Bundle',
-        'Reference Books Flash Sale',
-        'Audio Books Special',
-        'Educational Games Discount'
+        '{percent}% Off {subject}', 'Free Shipping on {subject}', '{subject} Study Bundle',
+        '{subject} Complete Course', '{subject} Professional Certification', 'Advanced {subject} Program',
+        '{subject} Student Package', 'Digital {subject} Library'
     ],
     'Home & Garden': [
-        'Furniture {discount}% Off',
-        'Garden Tools Bundle',
-        'Home Decor Sale',
-        'Kitchen Appliances Cashback',
-        'Cleaning Supplies Flash Sale',
-        'Outdoor Furniture Discount',
-        'Home Improvement Special',
-        'Gardening Equipment Bundle',
-        'Interior Design Deal',
-        'Home Security Discount',
-        'Plant Collection Flash Sale',
-        'Lighting Fixtures Bundle',
-        'Storage Solutions Special',
-        'Bedding Set Deal',
-        'Cookware Discount Offer'
+        '{percent}% Off {item}', 'Free Installation {item}', '{item} Home Makeover',
+        '{item} Seasonal Collection', '{item} Smart Home Bundle', 'Eco-Friendly {item}',
+        '{item} Designer Series', 'Professional {item} Service'
     ],
     'Automotive': [
-        'Car Parts {discount}% Off',
-        'Auto Service Bundle',
-        'Car Accessories Sale',
-        'Vehicle Maintenance Cashback',
-        'Auto Parts Flash Sale',
-        'Car Care Products Discount',
-        'Tire Replacement Special',
-        'Auto Insurance Bundle',
-        'Car Wash Deal',
-        'Vehicle Upgrade Discount',
-        'Engine Oil Flash Sale',
-        'Car Electronics Bundle',
-        'Dashboard Accessories Special',
-        'Car Audio System Deal',
-        'Vehicle Safety Discount'
+        '{percent}% Off {service}', 'Free {service} Check', '{service} Premium Package',
+        '{service} Express Deal', '{service} Professional Care', 'Complete {service} Solution',
+        '{service} Warranty Package', 'Emergency {service} Deal'
     ]
+}
+
+# منتجات وخدمات حسب الفئة
+CATEGORY_ITEMS = {
+    'Electronics': ['Smartphone', 'Laptop', 'Headphones', 'TV', 'Camera', 'Tablet', 'Smartwatch', 'Gaming Console'],
+    'Food': ['Pizza', 'Burger', 'Sushi', 'Pasta', 'Salad', 'Coffee', 'Dessert', 'Sandwich'],
+    'Fashion': ['Dress', 'Shoes', 'Jacket', 'Jeans', 'T-Shirt', 'Bag', 'Watch', 'Sunglasses'],
+    'Travel': ['Paris Trip', 'Beach Resort', 'City Tour', 'Mountain Hiking', 'Cruise', 'Safari', 'Hotel Stay', 'Flight'],
+    'Entertainment': ['Movie Tickets', 'Concert', 'Theater Show', 'Sports Event', 'Comedy Show', 'Music Festival', 'Art Exhibition', 'Gaming'],
+    'Health & Beauty': ['Facial Treatment', 'Massage', 'Skincare', 'Makeup', 'Hair Care', 'Spa Day', 'Wellness Program', 'Fitness Class'],
+    'Sports & Fitness': ['Gym Membership', 'Yoga Classes', 'Running Shoes', 'Fitness Equipment', 'Sports Gear', 'Personal Training', 'Swimming Pool', 'Tennis Lessons'],
+    'Books & Education': ['Programming Course', 'Language Learning', 'Business Books', 'Science Textbooks', 'Online Course', 'Certification Program', 'E-books', 'Audiobooks'],
+    'Home & Garden': ['Furniture', 'Garden Tools', 'Home Decor', 'Kitchen Appliances', 'Lighting', 'Plants', 'Cleaning Service', 'Interior Design'],
+    'Automotive': ['Oil Change', 'Car Wash', 'Tire Service', 'Engine Repair', 'Car Insurance', 'Vehicle Inspection', 'Auto Parts', 'Roadside Assistance']
 }
 
 def generate_coupon_code():
     """توليد كود كوبون عشوائي"""
-    letters = ''.join(random.choices(string.ascii_uppercase, k=3))
-    numbers = ''.join(random.choices(string.digits, k=3))
-    return f"{letters}{numbers}"
+    return ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
 
-def generate_coupon_name_and_description(category_name, coupon_type_name):
-    """توليد اسم ووصف الكوبون"""
-    templates = COUPON_TEMPLATES.get(category_name, ['Special Offer'])
+def generate_coupon_name(category_name):
+    """توليد اسم كوبون واقعي"""
+    templates = COUPON_TEMPLATES.get(category_name, ['{percent}% Off {item}'])
+    items = CATEGORY_ITEMS.get(category_name, ['Product'])
+    
     template = random.choice(templates)
+    item = random.choice(items)
+    percent = random.choice([10, 15, 20, 25, 30, 40, 50])
     
-    # إضافة نسبة خصم عشوائية إذا كان في القالب
-    if '{discount}' in template:
-        discount = random.choice([10, 15, 20, 25, 30, 35, 40, 50])
-        name = template.format(discount=discount)
-    else:
-        name = template
+    # استبدال المتغيرات
+    name = template.replace('{percent}', str(percent))
+    name = name.replace('{product}', item)
+    name = name.replace('{item}', item)
+    name = name.replace('{equipment}', item)
+    name = name.replace('{subject}', item)
+    name = name.replace('{service}', item)
+    name = name.replace('{destination}', item)
+    name = name.replace('{event}', item)
+    name = name.replace('{accessory}', random.choice(['Case', 'Charger', 'Stand', 'Cover']))
     
-    # توليد وصف مناسب
+    return name
+
+def generate_description(category_name, coupon_name):
+    """توليد وصف واقعي للكوبون"""
     descriptions = {
-        'Discount': f'Get special discount on {category_name.lower()} items with amazing savings',
-        'Bundle Deal': f'Special bundle pricing for {category_name.lower()} products - buy more save more',
-        'Free Shipping': f'Free shipping on {category_name.lower()} orders above minimum purchase',
-        'Buy One Get One': f'Buy one {category_name.lower()} item, get another absolutely free',
-        'Cashback': f'Get instant cashback on {category_name.lower()} purchases',
-        'Flash Sale': f'Limited time flash sale on premium {category_name.lower()} items',
-        'Loyalty Reward': f'Exclusive {category_name.lower()} deals for our valued loyal customers',
-        'First Time Buyer': f'Special welcome discount on {category_name.lower()} for new customers',
-        'Seasonal Sale': f'Seasonal {category_name.lower()} promotion with huge savings',
-        'Bulk Purchase': f'Volume discount on {category_name.lower()} items for bulk orders'
+        'Electronics': [
+            f"Get the latest technology with amazing discounts on {coupon_name}",
+            f"Limited time offer on premium electronics - {coupon_name}",
+            f"Upgrade your tech setup with this exclusive {coupon_name} deal"
+        ],
+        'Food': [
+            f"Delicious meals at unbeatable prices - {coupon_name}",
+            f"Satisfy your cravings with our special {coupon_name} offer",
+            f"Fresh ingredients and great taste in every {coupon_name}"
+        ],
+        'Fashion': [
+            f"Stay stylish with our trendy {coupon_name} collection",
+            f"Fashion-forward designs at incredible prices - {coupon_name}",
+            f"Express your style with premium {coupon_name} deals"
+        ],
+        'Travel': [
+            f"Explore amazing destinations with {coupon_name} packages",
+            f"Create unforgettable memories with {coupon_name} adventures",
+            f"Discover the world with exclusive {coupon_name} offers"
+        ],
+        'Entertainment': [
+            f"Enjoy premium entertainment with {coupon_name} experiences",
+            f"Fun and excitement await with {coupon_name} deals",
+            f"Make every moment special with {coupon_name} offers"
+        ],
+        'Health & Beauty': [
+            f"Pamper yourself with luxurious {coupon_name} treatments",
+            f"Look and feel your best with {coupon_name} services",
+            f"Professional care and premium products in {coupon_name}"
+        ],
+        'Sports & Fitness': [
+            f"Achieve your fitness goals with {coupon_name} programs",
+            f"Stay active and healthy with {coupon_name} deals",
+            f"Professional training and quality equipment in {coupon_name}"
+        ],
+        'Books & Education': [
+            f"Expand your knowledge with {coupon_name} resources",
+            f"Learn new skills and advance your career with {coupon_name}",
+            f"Quality education and expert instruction in {coupon_name}"
+        ],
+        'Home & Garden': [
+            f"Transform your living space with {coupon_name} solutions",
+            f"Create the perfect home environment with {coupon_name}",
+            f"Quality products and professional service in {coupon_name}"
+        ],
+        'Automotive': [
+            f"Keep your vehicle running smoothly with {coupon_name} services",
+            f"Professional automotive care with {coupon_name} deals",
+            f"Reliable service and quality parts in {coupon_name}"
+        ]
     }
     
-    description = descriptions.get(coupon_type_name, f'Amazing special offer on {category_name.lower()} products')
-    
-    return name, description
+    category_descriptions = descriptions.get(category_name, [f"Great deal on {coupon_name}"])
+    return random.choice(category_descriptions)
 
-def generate_price(category_name):
-    """توليد سعر مناسب للفئة"""
-    price_ranges = {
-        'Electronics': (50, 1500),
-        'Food': (5, 100),
-        'Fashion': (20, 500),
-        'Travel': (100, 2000),
-        'Entertainment': (10, 200),
-        'Health & Beauty': (15, 300),
-        'Sports & Fitness': (25, 800),
-        'Books & Education': (10, 150),
-        'Home & Garden': (30, 1000),
-        'Automotive': (50, 2000)
-    }
-    
-    min_price, max_price = price_ranges.get(category_name, (10, 100))
-    return round(random.uniform(min_price, max_price), 2)
-
-def clear_tables():
+def clear_existing_data():
     """مسح البيانات الموجودة"""
-    conn = get_db_connection()
-    cursor = conn.cursor()
+    conn = get_connection()
+    cur = conn.cursor()
     
-    print("🗑️ مسح البيانات الموجودة...")
+    print("🧹 Clearing existing data...")
     
+    try:
+        cur.execute("DELETE FROM user_interactions")
+        cur.execute("DELETE FROM coupons")
+        cur.execute("ALTER SEQUENCE coupons_id_seq RESTART WITH 1")
+        cur.execute("ALTER SEQUENCE user_interactions_id_seq RESTART WITH 1")
+        
+        conn.commit()
+        print("✅ Existing data cleared")
+    except Exception as e:
+        print(f"❌ Error clearing data: {e}")
+        conn.rollback()
+    finally:
+        cur.close()
+        conn.close()
 
-    tables = ['user_interactions', 'coupons', 'coupon_types', 'categories']
+def populate_coupons(num_coupons=6000):
+    """إضافة كوبونات بطريقة مدروسة"""
+    conn = get_connection()
+    cur = conn.cursor()
     
-    for table in tables:
-        cursor.execute(f"DELETE FROM {table}")
-        print(f"   ✅ تم مسح جدول {table}")
+    print(f"📦 Adding {num_coupons} coupons...")
     
-    conn.commit()
-    cursor.close()
-    conn.close()
-
-def populate_categories():
-    """ملء جدول الفئات"""
-    conn = get_db_connection()
-    cursor = conn.cursor()
+    # توزيع متوازن للفئات
+    coupons_per_category = num_coupons // len(CATEGORIES)
     
-    print("📂 إضافة الفئات...")
+    coupon_id = 1
     
     for category in CATEGORIES:
-        cursor.execute(
-            "INSERT INTO categories (id, name) VALUES (%s, %s)",
-            (category['id'], category['name'])
-        )
-    
-    conn.commit()
-    cursor.close()
-    conn.close()
-    print(f"   ✅ تم إضافة {len(CATEGORIES)} فئة")
-
-def populate_coupon_types():
-    """ملء جدول أنواع الكوبونات"""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    print("🏷️ إضافة أنواع الكوبونات...")
-    
-    for coupon_type in COUPON_TYPES:
-        cursor.execute(
-            "INSERT INTO coupon_types (id, name, description) VALUES (%s, %s, %s)",
-            (coupon_type['id'], coupon_type['name'], coupon_type['description'])
-        )
-    
-    conn.commit()
-    cursor.close()
-    conn.close()
-    print(f"   ✅ تم إضافة {len(COUPON_TYPES)} نوع كوبون")
-
-def populate_coupons(count=2000):
-    """ملء جدول الكوبونات"""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    print(f"🎫 إضافة {count} كوبون...")
-    
-    for i in range(1, count + 1):
-        category = random.choice(CATEGORIES)
-        coupon_type = random.choice(COUPON_TYPES)
+        category_id = category['id']
+        category_name = category['name']
         
-        name, description = generate_coupon_name_and_description(
-            category['name'], coupon_type['name']
-        )
+        print(f"  📂 Adding {coupons_per_category} coupons for {category_name}...")
         
-        price = generate_price(category['name'])
-        provider_id = random.randint(1, 100)
-        coupon_status = random.choice([0, 1])  # 0 = inactive, 1 = active
-        coupon_code = generate_coupon_code()
-        
-        # تاريخ عشوائي في المستقبل
-        start_date = datetime.now()
-        end_date = start_date + timedelta(days=random.randint(30, 365))
-        date = end_date.strftime('%Y-%m-%d')
-        
-        cursor.execute("""
-            INSERT INTO coupons 
-            (id, name, description, price, coupon_type_id, category_id, 
-             provider_id, coupon_status, coupon_code, date) 
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        """, (
-            i, name, description, price, coupon_type['id'], category['id'],
-            provider_id, coupon_status, coupon_code, date
-        ))
-        
-        if i % 500 == 0:
-            print(f"   📊 تم إضافة {i} كوبون...")
-            conn.commit()
-    
-    conn.commit()
-    cursor.close()
-    conn.close()
-    print(f"   ✅ تم إضافة {count} كوبون بنجاح")
-
-def populate_user_interactions_balanced(count=2000):
-    """ملء جدول التفاعلات مع توزيع متوازن للفئات"""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    print(f"👥 إضافة {count} تفاعل بتوزيع متوازن...")
-    
-    balanced_users = {}
-    
-
-    for user_id in range(1, 51): 
-        if user_id <= 10:
-            primary_category = ((user_id - 1) % 10) + 1
-            secondary_categories = random.sample([c for c in range(1, 11) if c != primary_category], 2)
-            balanced_users[user_id] = {
-                'categories': [primary_category] + secondary_categories,
-                'weights': [0.5, 0.3, 0.2]  # 50% رئيسي، 30% ثانوي أول، 20% ثانوي ثاني
-            }
-        elif user_id <= 30:
-            # مستخدمين مع فئتين متساويتين + فئة ثالثة
-            categories = random.sample(range(1, 11), 3)
-            balanced_users[user_id] = {
-                'categories': categories,
-                'weights': [0.4, 0.35, 0.25]  # توزيع أكثر توازناً
-            }
-        else:
-            num_categories = random.randint(3, 4)
-            categories = random.sample(range(1, 11), num_categories)
-            if num_categories == 3:
-                weights = [0.4, 0.35, 0.25]
+        for i in range(coupons_per_category):
+            # توزيع متوازن لأنواع الكوبونات
+            coupon_type_id = ((i % len(COUPON_TYPES)) + 1)
+            
+            # أسعار واقعية حسب الفئة
+            if category_name in ['Electronics', 'Automotive']:
+                price = round(random.uniform(50, 500), 2)
+            elif category_name in ['Travel', 'Home & Garden']:
+                price = round(random.uniform(30, 300), 2)
+            elif category_name in ['Fashion', 'Sports & Fitness']:
+                price = round(random.uniform(20, 200), 2)
             else:
-                weights = [0.3, 0.25, 0.25, 0.2]
+                price = round(random.uniform(5, 100), 2)
             
-            balanced_users[user_id] = {
-                'categories': categories,
-                'weights': weights
-            }
-    
-    for user_id in range(51, 101):
-        num_categories = random.randint(2, 4)
-        categories = random.sample(range(1, 11), num_categories)
-        # توزيع متوازن للأوزان
-        if num_categories == 2:
-            weights = [0.6, 0.4]
-        elif num_categories == 3:
-            weights = [0.45, 0.35, 0.2]
-        else:
-            weights = [0.35, 0.25, 0.25, 0.15]
-        
-        balanced_users[user_id] = {
-            'categories': categories,
-            'weights': weights
-        }
-    
-    actions = ['search', 'click', 'purchase']
-    action_scores = {'search': 2.0, 'click': 5.0, 'purchase': 15.0}
-    
-    for i in range(1, count + 1):
-        user_id = random.choice(list(balanced_users.keys()))
-        user_prefs = balanced_users[user_id]
-        
-        category_id = random.choices(user_prefs['categories'], weights=user_prefs['weights'])[0]
-        
-        cursor.execute(
-            "SELECT id FROM coupons WHERE category_id = %s ORDER BY RAND() LIMIT 1",
-            (category_id,)
-        )
-        result = cursor.fetchone()
-        
-        if result:
-            coupon_id = result[0]
+            name = generate_coupon_name(category_name)
+            description = generate_description(category_name, name)
+            coupon_code = generate_coupon_code()
             
-            action_weights = [0.35, 0.40, 0.25]
-            action = random.choices(actions, weights=action_weights)[0]
-            score = action_scores[action]
+            # تاريخ انتهاء عشوائي في المستقبل
+            end_date = datetime.now() + timedelta(days=random.randint(30, 365))
             
-            days_ago = random.randint(1, 30)
-            hours_ago = random.randint(0, 23)
-            minutes_ago = random.randint(0, 59)
-            timestamp = datetime.now() - timedelta(days=days_ago, hours=hours_ago, minutes=minutes_ago)
+            cur.execute("""
+                INSERT INTO coupons (name, description, price, coupon_type_id, category_id, 
+                                   provider_id, coupon_status, coupon_code, date)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """, (name, description, price, coupon_type_id, category_id, 
+                  random.randint(1, 100), 1, coupon_code, end_date.date()))
             
-            cursor.execute("""
-                INSERT INTO user_interactions 
-                (user_id, coupon_id, action, score, timestamp) 
-                VALUES (%s, %s, %s, %s, %s)
-            """, (user_id, coupon_id, action, score, timestamp))
-        
-        if i % 500 == 0:
-            print(f"   📊 تم إضافة {i} تفاعل...")
-            conn.commit()
+            coupon_id += 1
     
     conn.commit()
-    cursor.close()
+    cur.close()
     conn.close()
-    print(f"   ✅ تم إضافة {count} تفاعل بتوزيع متوازن بنجاح")
+    
+    print(f"✅ Added {num_coupons} coupons successfully")
 
-def generate_statistics():
-    """إحصائيات البيانات المولدة"""
-    conn = get_db_connection()
-    cursor = conn.cursor()
+def create_realistic_user_profiles():
+    """إنشاء ملفات مستخدمين واقعية"""
     
-    print("\n📊 إحصائيات البيانات المتوازنة:")
+    # أنماط مستخدمين مختلفة
+    user_profiles = {
+        # مستخدمين محبي التكنولوجيا
+        'tech_lovers': {
+            'user_ids': list(range(1, 21)),  # 20 مستخدم
+            'preferred_categories': [1],  # Electronics
+            'secondary_categories': [8, 7],  # Books, Sports
+            'behavior': 'heavy_researcher'  # يبحث كثير قبل الشراء
+        },
+        
+        # محبي الطعام
+        'food_enthusiasts': {
+            'user_ids': list(range(21, 41)),  # 20 مستخدم
+            'preferred_categories': [2],  # Food
+            'secondary_categories': [6, 5],  # Health & Beauty, Entertainment
+            'behavior': 'impulse_buyer'  # يشتري بسرعة
+        },
+        
+        # محبي الموضة
+        'fashion_lovers': {
+            'user_ids': list(range(41, 61)),  # 20 مستخدم
+            'preferred_categories': [3],  # Fashion
+            'secondary_categories': [6, 9],  # Health & Beauty, Home & Garden
+            'behavior': 'seasonal_shopper'  # يشتري حسب المواسم
+        },
+        
+        # محبي السفر
+        'travelers': {
+            'user_ids': list(range(61, 81)),  # 20 مستخدم
+            'preferred_categories': [4],  # Travel
+            'secondary_categories': [5, 1],  # Entertainment, Electronics
+            'behavior': 'planner'  # يخطط مسبقاً
+        },
+        
+        # مستخدمين متنوعين
+        'diverse_users': {
+            'user_ids': list(range(81, 151)),  # 70 مستخدم
+            'preferred_categories': list(range(1, 11)),  # كل الفئات
+            'secondary_categories': list(range(1, 11)),
+            'behavior': 'balanced'  # متوازن
+        }
+    }
     
-    cursor.execute("""
-        SELECT c.name, COUNT(co.id) as count 
-        FROM categories c 
-        LEFT JOIN coupons co ON c.id = co.category_id 
-        GROUP BY c.id, c.name 
+    return user_profiles
+
+def populate_interactions(num_interactions=6000):
+    """إضافة تفاعلات واقعية ومدروسة"""
+    conn = get_connection()
+    cur = conn.cursor()
+    
+    print(f"👥 Adding {num_interactions} user interactions...")
+    
+    # الحصول على معرفات الكوبونات
+    cur.execute("SELECT id, category_id FROM coupons")
+    coupons = cur.fetchall()
+    coupon_dict = {coupon[1]: [] for coupon in coupons}  # تجميع حسب الفئة
+    
+    for coupon in coupons:
+        coupon_dict[coupon[1]].append(coupon[0])
+    
+    user_profiles = create_realistic_user_profiles()
+    
+    interaction_id = 1
+    interactions_added = 0
+    
+    for profile_name, profile in user_profiles.items():
+        print(f"  👤 Creating interactions for {profile_name}...")
+        
+        for user_id in profile['user_ids']:
+            if interactions_added >= num_interactions:
+                break
+            
+            # عدد التفاعلات لكل مستخدم حسب نمطه
+            if profile['behavior'] == 'heavy_researcher':
+                user_interactions = random.randint(15, 30)
+            elif profile['behavior'] == 'impulse_buyer':
+                user_interactions = random.randint(8, 15)
+            elif profile['behavior'] == 'seasonal_shopper':
+                user_interactions = random.randint(10, 20)
+            elif profile['behavior'] == 'planner':
+                user_interactions = random.randint(12, 25)
+            else:  # balanced
+                user_interactions = random.randint(5, 15)
+            
+            # توزيع التفاعلات
+            for _ in range(min(user_interactions, num_interactions - interactions_added)):
+                
+                # اختيار الفئة (80% مفضلة، 20% ثانوية)
+                if random.random() < 0.8:
+                    category_id = random.choice(profile['preferred_categories'])
+                else:
+                    category_id = random.choice(profile['secondary_categories'])
+                
+                # اختيار كوبون من الفئة
+                if category_id in coupon_dict and coupon_dict[category_id]:
+                    coupon_id = random.choice(coupon_dict[category_id])
+                else:
+                    continue
+                
+                # نوع التفاعل حسب السلوك
+                if profile['behavior'] == 'heavy_researcher':
+                    # يبحث كثير، ينقر أحياناً، يشتري قليلاً
+                    action = random.choices(['search', 'click', 'purchase'], 
+                                         weights=[70, 25, 5])[0]
+                elif profile['behavior'] == 'impulse_buyer':
+                    # يشتري بسرعة
+                    action = random.choices(['search', 'click', 'purchase'], 
+                                         weights=[30, 30, 40])[0]
+                elif profile['behavior'] == 'seasonal_shopper':
+                    # متوازن
+                    action = random.choices(['search', 'click', 'purchase'], 
+                                         weights=[50, 35, 15])[0]
+                elif profile['behavior'] == 'planner':
+                    # يبحث ويخطط
+                    action = random.choices(['search', 'click', 'purchase'], 
+                                         weights=[60, 30, 10])[0]
+                else:  # balanced
+                    action = random.choices(['search', 'click', 'purchase'], 
+                                         weights=[50, 30, 20])[0]
+                
+                # النقاط
+                score = {'search': 2.0, 'click': 5.0, 'purchase': 15.0}[action]
+                
+                # التاريخ (آخر 90 يوم)
+                timestamp = datetime.now() - timedelta(days=random.randint(0, 90))
+                
+                cur.execute("""
+                    INSERT INTO user_interactions (user_id, coupon_id, action, score, timestamp)
+                    VALUES (%s, %s, %s, %s, %s)
+                """, (user_id, coupon_id, action, score, timestamp))
+                
+                interactions_added += 1
+                
+                if interactions_added >= num_interactions:
+                    break
+            
+            if interactions_added >= num_interactions:
+                break
+    
+    conn.commit()
+    cur.close()
+    conn.close()
+    
+    print(f"✅ Added {interactions_added} interactions successfully")
+
+def create_test_scenarios():
+    """إنشاء سيناريوهات اختبار محددة"""
+    conn = get_connection()
+    cur = conn.cursor()
+    
+    print("🧪 Creating test scenarios...")
+    
+    # سيناريو 1: مستخدم محب للإلكترونيات
+    test_user_1 = 999
+    cur.execute("SELECT id FROM coupons WHERE category_id = 1 LIMIT 5")
+    electronics_coupons = [row[0] for row in cur.fetchall()]
+    
+    for coupon_id in electronics_coupons[:3]:
+        cur.execute("""
+            INSERT INTO user_interactions (user_id, coupon_id, action, score, timestamp)
+            VALUES (%s, %s, %s, %s, %s)
+        """, (test_user_1, coupon_id, 'search', 2.0, datetime.now()))
+        
+        cur.execute("""
+            INSERT INTO user_interactions (user_id, coupon_id, action, score, timestamp)
+            VALUES (%s, %s, %s, %s, %s)
+        """, (test_user_1, coupon_id, 'click', 5.0, datetime.now()))
+    
+    # شراء واحد
+    cur.execute("""
+        INSERT INTO user_interactions (user_id, coupon_id, action, score, timestamp)
+        VALUES (%s, %s, %s, %s, %s)
+    """, (test_user_1, electronics_coupons[0], 'purchase', 15.0, datetime.now()))
+    
+    # سيناريو 2: مستخدم محب للطعام
+    test_user_2 = 998
+    cur.execute("SELECT id FROM coupons WHERE category_id = 2 LIMIT 5")
+    food_coupons = [row[0] for row in cur.fetchall()]
+    
+    for coupon_id in food_coupons[:4]:
+        cur.execute("""
+            INSERT INTO user_interactions (user_id, coupon_id, action, score, timestamp)
+            VALUES (%s, %s, %s, %s, %s)
+        """, (test_user_2, coupon_id, 'purchase', 15.0, datetime.now()))
+    
+    conn.commit()
+    cur.close()
+    conn.close()
+    
+    print("✅ Test scenarios created")
+    print("  🔬 Test User 999: Electronics lover")
+    print("  🔬 Test User 998: Food enthusiast")
+
+def print_statistics():
+    """طباعة إحصائيات البيانات"""
+    conn = get_connection()
+    cur = conn.cursor()
+    
+    print("\n📊 Database Statistics:")
+    print("=" * 50)
+    
+    # إحصائيات الكوبونات
+    cur.execute("""
+        SELECT c.name, COUNT(*) as count 
+        FROM coupons co 
+        JOIN categories c ON co.category_id = c.id 
+        GROUP BY c.name 
         ORDER BY count DESC
     """)
     
-    print("   🎫 الكوبونات لكل فئة:")
-    for category, count in cursor.fetchall():
-        print(f"      {category}: {count} كوبون")
+    print("📦 Coupons by Category:")
+    for row in cur.fetchall():
+        print(f"  {row[0]}: {row[1]} coupons")
     
-    cursor.execute("""
-        SELECT ui.user_id, COUNT(*) as interactions, 
-               SUM(CASE WHEN ui.action = 'purchase' THEN 1 ELSE 0 END) as purchases,
-               SUM(CASE WHEN ui.action = 'click' THEN 1 ELSE 0 END) as clicks,
-               SUM(CASE WHEN ui.action = 'search' THEN 1 ELSE 0 END) as searches
-        FROM user_interactions ui
-        WHERE ui.user_id <= 20
-        GROUP BY ui.user_id 
-        ORDER BY ui.user_id
+    # إحصائيات التفاعلات
+    cur.execute("""
+        SELECT action, COUNT(*) as count 
+        FROM user_interactions 
+        GROUP BY action 
+        ORDER BY count DESC
     """)
     
-    print("\n   👥 المستخدمين المتوازنين (للاختبار):")
-    for user_id, interactions, purchases, clicks, searches in cursor.fetchall():
-        print(f"      المستخدم {user_id}: {interactions} تفاعل ({purchases} مشتريات، {clicks} نقرات، {searches} بحث)")
+    print("\n👥 Interactions by Type:")
+    for row in cur.fetchall():
+        print(f"  {row[0]}: {row[1]} interactions")
     
-
-    cursor.execute("""
-        SELECT cat.name, COUNT(ui.id) as interactions,
-               SUM(CASE WHEN ui.action = 'purchase' THEN 1 ELSE 0 END) as purchases
-        FROM categories cat
-        JOIN coupons c ON cat.id = c.category_id
-        JOIN user_interactions ui ON c.id = ui.coupon_id
-        GROUP BY cat.id, cat.name
-        ORDER BY interactions DESC
+    # أكثر المستخدمين نشاطاً
+    cur.execute("""
+        SELECT user_id, COUNT(*) as interactions, SUM(score) as total_score
+        FROM user_interactions 
+        GROUP BY user_id 
+        ORDER BY interactions DESC 
+        LIMIT 5
     """)
     
-    print("\n   📈 التفاعلات لكل فئة (متوازنة):")
-    for category, interactions, purchases in cursor.fetchall():
-        print(f"      {category}: {interactions} تفاعل ({purchases} مشتريات)")
+    print("\n🏆 Top 5 Most Active Users:")
+    for row in cur.fetchall():
+        print(f"  User {row[0]}: {row[1]} interactions, {row[2]} total score")
     
-
-    cursor.execute("""
-        SELECT ui.user_id, cat.name, COUNT(ui.id) as interactions,
-               ROUND(COUNT(ui.id) * 100.0 / SUM(COUNT(ui.id)) OVER (PARTITION BY ui.user_id), 1) as percentage
-        FROM user_interactions ui
-        JOIN coupons c ON ui.coupon_id = c.id
-        JOIN categories cat ON c.category_id = cat.id
-        WHERE ui.user_id IN (1, 2, 3, 11, 21)
-        GROUP BY ui.user_id, cat.id, cat.name
-        ORDER BY ui.user_id, interactions DESC
-    """)
+    # إجمالي الإحصائيات
+    cur.execute("SELECT COUNT(*) FROM coupons")
+    total_coupons = cur.fetchone()[0]
     
-    print("\n   🎯 توزيع الفئات لمستخدمين مختارين:")
-    current_user = None
-    for user_id, category, interactions, percentage in cursor.fetchall():
-        if current_user != user_id:
-            if current_user is not None:
-                print()
-            print(f"      المستخدم {user_id}:")
-            current_user = user_id
-        print(f"        {category}: {interactions} تفاعل ({percentage}%)")
+    cur.execute("SELECT COUNT(*) FROM user_interactions")
+    total_interactions = cur.fetchone()[0]
     
-    cursor.close()
+    cur.execute("SELECT COUNT(DISTINCT user_id) FROM user_interactions")
+    unique_users = cur.fetchone()[0]
+    
+    print(f"\n📈 Total Statistics:")
+    print(f"  Total Coupons: {total_coupons}")
+    print(f"  Total Interactions: {total_interactions}")
+    print(f"  Unique Users: {unique_users}")
+    
+    cur.close()
     conn.close()
 
 def main():
     """الدالة الرئيسية"""
-    print("🚀 بدء ملء قاعدة البيانات بتوزيع متوازن...")
+    print("🚀 Starting Large Data Population for PostgreSQL")
     print("=" * 60)
     
     try:
-
-        clear_tables()
+        # مسح البيانات القديمة
+        clear_existing_data()
         
-
-        populate_categories()
-        populate_coupon_types()
-        populate_coupons(2000)
-        populate_user_interactions_balanced(2000)
+        # إضافة الكوبونات
+        populate_coupons(6000)
         
-
-        generate_statistics()
+        # إضافة التفاعلات
+        populate_interactions(6000)
         
-        print("\n" + "=" * 60)
-        print("✅ تم ملء قاعدة البيانات بتوزيع متوازن بنجاح!")
-        print("\n🧪 للاختبار المحسن:")
-        print("   1. شغل: POST http://localhost:8000/analyze")
-        print("   2. اختبر User 1: GET http://localhost:8000/get_recommendations?user_id=1&top_n=10")
-        print("   3. قيم الجودة: GET http://localhost:8000/evaluate_similarity?user_id=1")
-        print("   4. اختبر User 11: GET http://localhost:8000/get_recommendations?user_id=11&top_n=10")
-        print("   5. اختبر User 21: GET http://localhost:8000/get_recommendations?user_id=21&top_n=10")
+        # إنشاء سيناريوهات الاختبار
+        create_test_scenarios()
         
-        print("\n📋 التوزيع المتوازن الجديد:")
-        print("   • User 1-10: فئة رئيسية (50%) + فئتين ثانويتين (30%, 20%)")
-        print("   • User 11-30: ثلاث فئات متوازنة (40%, 35%, 25%)")
-        print("   • User 31-50: 3-4 فئات متقاربة")
-        print("   • النتيجة المتوقعة: توزيع أكثر توازناً في التوصيات")
+        # طباعة الإحصائيات
+        print_statistics()
+        
+        print("\n🎉 Data population completed successfully!")
+        print("\n🧪 Test Commands:")
+        print("  curl -X POST http://YOUR_SERVER:8000/build_vector_store")
+        print("  curl 'http://YOUR_SERVER:8000/get_recommendations?user_id=999&top_n=10'")
+        print("  curl 'http://YOUR_SERVER:8000/get_recommendations?user_id=998&top_n=10'")
         
     except Exception as e:
-        print(f"❌ خطأ: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"❌ Error: {e}")
 
 if __name__ == "__main__":
     main()
