@@ -1081,148 +1081,201 @@ def get_recommendations_smart_rerank(user_id: int, top_n: int = 10, db: Session 
 def evaluate_smart_system(test_users: int = 20, top_k: int = 10, db: Session = Depends(get_db)):
     """تقييم النظام الذكي مع إعادة الاقتراح"""
     
-    print(f"🔍 Evaluating SMART system...")
+    logger.info(f"🔍 Starting smart evaluation with {test_users} users...")
     
-    active_users = db.query(
-        UserInteraction.user_id,
-        func.count(UserInteraction.id).label('interaction_count')
-    ).group_by(UserInteraction.user_id)\
-     .having(func.count(UserInteraction.id) >= 10)\
-     .order_by(func.count(UserInteraction.id).desc())\
-     .limit(test_users).all()
-    
-    precision_scores = []
-    recall_scores = []
-    f1_scores = []
-    evaluation_details = []
-    
-    for user_id, interaction_count in active_users:
-        try:
-            all_interactions = db.query(UserInteraction).filter(
-                UserInteraction.user_id == user_id
-            ).order_by(UserInteraction.timestamp).all()
-            
-            if len(all_interactions) < 10:
-                continue
-            
-            split_point = int(len(all_interactions) * 0.8)
-            test_interactions = all_interactions[split_point:]
-            
-            relevant_items = set()
-            for inter in test_interactions:
-                if inter.score >= 5.0:
-                    relevant_items.add(inter.coupon_id)
-            
-            if not relevant_items:
-                continue
-            
-            test_interaction_ids = [inter.id for inter in test_interactions]
-            
-            test_data = []
-            for inter in test_interactions:
-                test_data.append({
-                    'user_id': inter.user_id,
-                    'coupon_id': inter.coupon_id,
-                    'action': inter.action,
-                    'score': inter.score,
-                    'timestamp': inter.timestamp
-                })
-            
-            db.query(UserInteraction).filter(
-                UserInteraction.id.in_(test_interaction_ids)
-            ).delete(synchronize_session=False)
-            db.commit()
-            
+    try:
+        # الحصول على مستخدمين نشطين
+        active_users = db.query(
+            UserInteraction.user_id,
+            func.count(UserInteraction.id).label('interaction_count')
+        ).group_by(UserInteraction.user_id)\
+         .having(func.count(UserInteraction.id) >= 10)\
+         .order_by(func.count(UserInteraction.id).desc())\
+         .limit(test_users).all()
+        
+        if not active_users:
+            return {"error": "No active users found"}
+        
+        logger.info(f"📊 Found {len(active_users)} active users")
+        
+        precision_scores = []
+        recall_scores = []
+        f1_scores = []
+        evaluation_details = []
+        
+        for i, (user_id, interaction_count) in enumerate(active_users):
             try:
-                recommendations_data = get_recommendations_smart_rerank(user_id, top_k, db)
-                recommended_items = set(recommendations_data["recommendations"])
+                logger.info(f"  Evaluating user {user_id} ({i+1}/{len(active_users)})")
+                
+                # تفاعلات المستخدم
+                all_interactions = db.query(UserInteraction).filter(
+                    UserInteraction.user_id == user_id
+                ).order_by(UserInteraction.timestamp).all()
+                
+                if len(all_interactions) < 10:
+                    continue
+                
+                # تقسيم زمني
+                split_point = int(len(all_interactions) * 0.8)
+                test_interactions = all_interactions[split_point:]
+                
+                # العناصر المناسبة في الاختبار
+                relevant_items = set()
+                for inter in test_interactions:
+                    if inter.score >= 5.0:  # click أو purchase
+                        relevant_items.add(inter.coupon_id)
+                
+                if not relevant_items:
+                    continue
+                
+                # حذف مؤقت لتفاعلات الاختبار
+                test_interaction_ids = [inter.id for inter in test_interactions]
+                
+                # حفظ تفاعلات الاختبار
+                test_data = []
+                for inter in test_interactions:
+                    test_data.append({
+                        'user_id': inter.user_id,
+                        'coupon_id': inter.coupon_id,
+                        'action': inter.action,
+                        'score': inter.score,
+                        'timestamp': inter.timestamp
+                    })
+                
+                # حذف مؤقت
+                db.query(UserInteraction).filter(
+                    UserInteraction.id.in_(test_interaction_ids)
+                ).delete(synchronize_session=False)
+                db.commit()
+                
+                # الحصول على التوصيات الذكية
+                try:
+                    recommendations_data = get_recommendations_smart_rerank(user_id, top_k, db)
+                    recommended_items = set(recommendations_data["recommendations"])
+                except Exception as e:
+                    logger.error(f"Error getting recommendations for user {user_id}: {e}")
+                    recommended_items = set()
+                
+                # إعادة إدراج تفاعلات الاختبار
+                for data in test_data:
+                    new_interaction = UserInteraction(
+                        user_id=data['user_id'],
+                        coupon_id=data['coupon_id'],
+                        action=data['action'],
+                        score=data['score'],
+                        timestamp=data['timestamp']
+                    )
+                    db.add(new_interaction)
+                db.commit()
+                
+                # حساب المقاييس
+                true_positives = len(recommended_items.intersection(relevant_items))
+                
+                precision = true_positives / len(recommended_items) if recommended_items else 0
+                recall = true_positives / len(relevant_items) if relevant_items else 0
+                f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+                
+                precision_scores.append(precision)
+                recall_scores.append(recall)
+                f1_scores.append(f1)
+                
+                evaluation_details.append({
+                    'user_id': user_id,
+                    'relevant_items': len(relevant_items),
+                    'recommended_items': len(recommended_items),
+                    'true_positives': true_positives,
+                    'precision': round(precision, 4),
+                    'recall': round(recall, 4),
+                    'f1_score': round(f1, 4),
+                    'overlap_items': list(recommended_items.intersection(relevant_items))[:3]
+                })
+                
             except Exception as e:
-                print(f"Error getting recommendations for user {user_id}: {e}")
-                recommended_items = set()
-            
-            for data in test_data:
-                new_interaction = UserInteraction(
-                    user_id=data['user_id'],
-                    coupon_id=data['coupon_id'],
-                    action=data['action'],
-                    score=data['score'],
-                    timestamp=data['timestamp']
-                )
-                db.add(new_interaction)
-            db.commit()
-            
-            true_positives = len(recommended_items.intersection(relevant_items))
-            
-            precision = true_positives / len(recommended_items) if recommended_items else 0
-            recall = true_positives / len(relevant_items) if relevant_items else 0
-            f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
-            
-            precision_scores.append(precision)
-            recall_scores.append(recall)
-            f1_scores.append(f1)
-            
-            evaluation_details.append({
-                'user_id': user_id,
-                'relevant_items': len(relevant_items),
-                'recommended_items': len(recommended_items),
-                'true_positives': true_positives,
-                'precision': round(precision, 4),
-                'recall': round(recall, 4),
-                'f1_score': round(f1, 4),
-                'overlap_items': list(recommended_items.intersection(relevant_items))
-            })
-            
-        except Exception as e:
-            print(f"Error with user {user_id}: {e}")
-            continue
-    
-    if not evaluation_details:
-        return {"error": "No valid evaluations"}
-    
-    avg_precision = np.mean(precision_scores)
-    avg_recall = np.mean(recall_scores)
-    avg_f1 = np.mean(f1_scores)
-    
-    previous_f1 = 0.0134
-    improvement_f1 = ((avg_f1 - previous_f1) / previous_f1 * 100) if previous_f1 > 0 else 0
-    
-    if avg_f1 >= 0.15:
-        performance_level = "Good"
-    elif avg_f1 >= 0.05:
-        performance_level = "Fair"
-    else:
-        performance_level = "Poor"
-    
-    return {
-        "smart_evaluation_summary": {
-            "performance_level": performance_level,
-            "users_evaluated": len(evaluation_details),
-            "evaluation_method": "Smart re-ranking with high-score preferences"
-        },
-        "core_metrics": {
-            "precision": {
-                "average": round(avg_precision, 4),
-                "previous": 0.0167,
-                "improvement": f"{round(((avg_precision - 0.0167) / 0.0167 * 100) if 0.0167 > 0 else 0, 1)}%"
+                logger.error(f"Error with user {user_id}: {e}")
+                continue
+        
+        if not evaluation_details:
+            return {"error": "No valid evaluations completed"}
+        
+        # حساب النتائج
+        avg_precision = np.mean(precision_scores) if precision_scores else 0
+        avg_recall = np.mean(recall_scores) if recall_scores else 0
+        avg_f1 = np.mean(f1_scores) if f1_scores else 0
+        
+        # مقارنة مع النتائج السابقة
+        previous_f1 = 0.0134
+        improvement_f1 = ((avg_f1 - previous_f1) / previous_f1 * 100) if previous_f1 > 0 else 0
+        
+        # تحديد مستوى الأداء
+        if avg_f1 >= 0.15:
+            performance_level = "Good"
+        elif avg_f1 >= 0.05:
+            performance_level = "Fair"
+        else:
+            performance_level = "Poor"
+        
+        return {
+            "smart_evaluation_summary": {
+                "performance_level": performance_level,
+                "users_evaluated": len(evaluation_details),
+                "evaluation_method": "Smart re-ranking with high-score preferences",
+                "evaluation_timestamp": datetime.now().isoformat()
             },
-            "recall": {
-                "average": round(avg_recall, 4),
-                "previous": 0.0113
+            "core_metrics": {
+                "precision": {
+                    "average": round(avg_precision, 4),
+                    "previous": 0.0167,
+                    "improvement": f"{round(((avg_precision - 0.0167) / 0.0167 * 100) if 0.0167 > 0 else 0, 1)}%"
+                },
+                "recall": {
+                    "average": round(avg_recall, 4),
+                    "previous": 0.0113,
+                    "improvement": f"{round(((avg_recall - 0.0113) / 0.0113 * 100) if 0.0113 > 0 else 0, 1)}%"
+                },
+                "f1_score": {
+                    "average": round(avg_f1, 4),
+                    "previous": previous_f1,
+                    "improvement": f"{round(improvement_f1, 1)}%"
+                }
             },
-            "f1_score": {
-                "average": round(avg_f1, 4),
-                "previous": previous_f1,
-                "improvement": f"{round(improvement_f1, 1)}%"
+            "performance_distribution": {
+                "good_users": len([r for r in evaluation_details if r['f1_score'] >= 0.15]),
+                "fair_users": len([r for r in evaluation_details if 0.05 <= r['f1_score'] < 0.15]),
+                "poor_users": len([r for r in evaluation_details if r['f1_score'] < 0.05]),
+                "users_with_matches": len([r for r in evaluation_details if r['true_positives'] > 0])
+            },
+            "sample_results": evaluation_details[:5],
+            "improvement_summary": f"F1-Score improved from {previous_f1:.4f} to {avg_f1:.4f} ({improvement_f1:.1f}% improvement)"
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Evaluation failed: {e}")
+        return {"error": f"Evaluation failed: {str(e)}"}
+
+@app.get("/simple_smart_test")
+def simple_smart_test(user_id: int = 372, db: Session = Depends(get_db)):
+    """اختبار بسيط للنظام الذكي"""
+    
+    try:
+        # اختبار التوصيات العادية
+        normal_recs = get_recommendations(user_id, 5, db)
+        
+        # اختبار التوصيات الذكية
+        smart_recs = get_recommendations_smart_rerank(user_id, 5, db)
+        
+        return {
+            "test_result": "Success",
+            "user_id": user_id,
+            "normal_recommendations": normal_recs["recommendations"],
+            "smart_recommendations": smart_recs["recommendations"],
+            "difference": {
+                "overlap": len(set(normal_recs["recommendations"]).intersection(set(smart_recs["recommendations"]))),
+                "smart_method_stats": smart_recs.get("rerank_stats", {})
             }
-        },
-        "performance_distribution": {
-            "good": len([r for r in evaluation_details if r['f1_score'] >= 0.15]),
-            "fair": len([r for r in evaluation_details if 0.05 <= r['f1_score'] < 0.15]),
-            "poor": len([r for r in evaluation_details if r['f1_score'] < 0.05])
-        },
-        "sample_results": evaluation_details[:5],
-        "improvement_summary": f"F1-Score improved from {previous_f1:.4f} to {avg_f1:.4f}"
-    }
+        }
+        
+    except Exception as e:
+        return {"error": f"Test failed: {str(e)}"}
 
 @app.get("/compare_recommendation_methods")
 def compare_recommendation_methods(user_id: int, top_n: int = 10, db: Session = Depends(get_db)):
