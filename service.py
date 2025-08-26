@@ -731,6 +731,228 @@ def quick_performance_check(sample_size: int = 10, db: Session = Depends(get_db)
         }
     }
 
+@app.get("/get_recommendations_with_rerank")
+def get_recommendations_with_rerank(user_id: int, top_n: int = 10, allow_seen: bool = True, db: Session = Depends(get_db)):
+    """توصيات مع السماح بإعادة اقتراح بعض العناصر المُشاهدة"""
+    
+    if faiss_index is None or model is None:
+        raise HTTPException(status_code=500, detail="System not ready")
+    
+    interactions = db.query(UserInteraction).filter(UserInteraction.user_id == user_id).all()
+    
+    if not interactions:
+        # مستخدم جديد - اقترح الأشهر
+        popular_coupons = db.query(UserInteraction.coupon_id, func.sum(UserInteraction.score).label('total_score'))\
+                           .group_by(UserInteraction.coupon_id)\
+                           .order_by(func.sum(UserInteraction.score).desc())\
+                           .limit(top_n).all()
+        return {"recommendations": [c.coupon_id for c in popular_coupons], "method": "popular"}
+    
+    # بناء ملف المستخدم
+    weighted_emb = np.zeros(vector_dim)
+    total_weight = 0
+    user_categories = {}
+    seen_coupons = set()
+    
+    for inter in interactions:
+        coupon = db.query(Coupon).filter(Coupon.id == inter.coupon_id).first()
+        if not coupon:
+            continue
+            
+        seen_coupons.add(coupon.id)
+        category = db.query(Category).filter(Category.id == coupon.category_id).first()
+        coupon_type = db.query(CouponType).filter(CouponType.id == coupon.coupon_type_id).first()
+        
+        text = build_enhanced_text(coupon, category, coupon_type)
+        embedding = model.encode([text])[0]
+        
+        weight = inter.score
+        if inter.action == 'purchase':
+            weight *= 2.0
+        
+        weighted_emb += embedding * weight
+        total_weight += weight
+        
+        if category:
+            user_categories[category.name] = user_categories.get(category.name, 0) + inter.score
+    
+    if total_weight > 0:
+        weighted_emb /= total_weight
+    
+    # البحث في المتجهات
+    similarities, indices = faiss_index.search(weighted_emb.reshape(1, -1).astype('float32'), min(top_n * 5, len(coupon_ids)))
+    
+    recommendations = []
+    category_counts = {}
+    max_per_category = max(2, top_n // len(user_categories)) if user_categories else top_n
+    
+    # **التعديل الرئيسي:** السماح ببعض العناصر المُشاهدة
+    seen_allowed = 0
+    max_seen_allowed = max(1, top_n // 4)  # السماح بـ 25% من العناصر المُشاهدة
+    
+    for sim, idx in zip(similarities[0], indices[0]):
+        if len(recommendations) >= top_n:
+            break
+            
+        coupon_id = coupon_ids[idx]
+        
+        # التحقق من العناصر المُشاهدة
+        if coupon_id in seen_coupons:
+            if not allow_seen or seen_allowed >= max_seen_allowed:
+                continue
+            seen_allowed += 1
+        
+        coupon = db.query(Coupon).filter(Coupon.id == coupon_id).first()
+        if not coupon:
+            continue
+            
+        category = db.query(Category).filter(Category.id == coupon.category_id).first()
+        category_name = category.name if category else "Unknown"
+        
+        # تحديد التوزيع
+        if category_counts.get(category_name, 0) >= max_per_category:
+            continue
+            
+        recommendations.append(coupon_id)
+        category_counts[category_name] = category_counts.get(category_name, 0) + 1
+    
+    # ملء الباقي إذا لم نصل للعدد المطلوب
+    while len(recommendations) < top_n:
+        for sim, idx in zip(similarities[0], indices[0]):
+            if len(recommendations) >= top_n:
+                break
+                
+            coupon_id = coupon_ids[idx]
+            if coupon_id not in recommendations:
+                recommendations.append(coupon_id)
+    
+    return {
+        "recommendations": recommendations[:top_n],
+        "method": "content_based_with_rerank",
+        "user_categories": user_categories,
+        "seen_items_included": seen_allowed,
+        "total_seen_items": len(seen_coupons)
+    }
+
+@app.get("/get_recommendations_simple")
+def get_recommendations_simple(user_id: int, top_n: int = 10, db: Session = Depends(get_db)):
+    """توصيات بسيطة - تركز على التشابه فقط"""
+    
+    if faiss_index is None or model is None:
+        raise HTTPException(status_code=500, detail="System not ready")
+    
+    interactions = db.query(UserInteraction).filter(UserInteraction.user_id == user_id).all()
+    
+    if not interactions:
+        # مستخدم جديد
+        popular_coupons = db.query(Coupon.id).order_by(func.random()).limit(top_n).all()
+        return {"recommendations": [c.id for c in popular_coupons], "method": "random_for_new_user"}
+    
+    # بناء ملف المستخدم البسيط
+    user_text = ""
+    user_categories = {}
+    
+    for inter in interactions:
+        coupon = db.query(Coupon).filter(Coupon.id == inter.coupon_id).first()
+        if coupon:
+            category = db.query(Category).filter(Category.id == coupon.category_id).first()
+            coupon_type = db.query(CouponType).filter(CouponType.id == coupon.coupon_type_id).first()
+            
+            # وزن النص حسب النقاط
+            weight = int(inter.score / 2)  # تقليل الوزن
+            text = build_enhanced_text(coupon, category, coupon_type)
+            user_text += (text + " ") * weight
+            
+            if category:
+                user_categories[category.name] = user_categories.get(category.name, 0) + inter.score
+    
+    # تشفير ملف المستخدم
+    user_embedding = model.encode([user_text])[0]
+    
+    # البحث
+    similarities, indices = faiss_index.search(user_embedding.reshape(1, -1).astype('float32'), top_n * 2)
+    
+    # أخذ أفضل النتائج مباشرة (بدون تعقيد)
+    recommendations = []
+    for sim, idx in zip(similarities[0], indices[0]):
+        if len(recommendations) >= top_n:
+            break
+        recommendations.append(coupon_ids[idx])
+    
+    return {
+        "recommendations": recommendations,
+        "method": "simple_content_based",
+        "user_categories": user_categories
+    }
+
+@app.get("/evaluate_simple_system")
+def evaluate_simple_system(test_users: int = 20, db: Session = Depends(get_db)):
+    """تقييم النظام البسيط"""
+    
+    active_users = db.query(UserInteraction.user_id).distinct().limit(test_users).all()
+    
+    results = []
+    
+    for user_tuple in active_users:
+        user_id = user_tuple[0]
+        
+        # تفاعلات المستخدم
+        interactions = db.query(UserInteraction).filter(
+            UserInteraction.user_id == user_id
+        ).order_by(UserInteraction.timestamp).all()
+        
+        if len(interactions) < 5:
+            continue
+        
+        # تقسيم بسيط: آخر 20% كاختبار
+        split = int(len(interactions) * 0.8)
+        test_interactions = interactions[split:]
+        
+        # العناصر المناسبة
+        relevant_items = set(inter.coupon_id for inter in test_interactions if inter.score >= 5.0)
+        
+        if not relevant_items:
+            continue
+        
+        # التوصيات مع السماح بإعادة الاقتراح
+        try:
+            rec_data = get_recommendations_with_rerank(user_id, 10, True, db)
+            recommended = set(rec_data["recommendations"])
+        except:
+            continue
+        
+        # حساب التطابق
+        matches = len(recommended.intersection(relevant_items))
+        precision = matches / len(recommended) if recommended else 0
+        recall = matches / len(relevant_items) if relevant_items else 0
+        
+        results.append({
+            'user_id': user_id,
+            'precision': round(precision, 4),
+            'recall': round(recall, 4),
+            'matches': matches,
+            'relevant_count': len(relevant_items),
+            'recommended_count': len(recommended)
+        })
+    
+    if not results:
+        return {"error": "No results"}
+    
+    avg_precision = sum(r['precision'] for r in results) / len(results)
+    avg_recall = sum(r['recall'] for r in results) / len(results)
+    avg_f1 = 2 * (avg_precision * avg_recall) / (avg_precision + avg_recall) if (avg_precision + avg_recall) > 0 else 0
+    
+    return {
+        "simple_evaluation": {
+            "average_precision": round(avg_precision, 4),
+            "average_recall": round(avg_recall, 4),
+            "average_f1": round(avg_f1, 4),
+            "users_evaluated": len(results)
+        },
+        "expected_improvement": f"F1 should improve from 0.0134 to ~{avg_f1:.4f}",
+        "sample_results": results[:5]
+    }
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
