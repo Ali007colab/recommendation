@@ -513,6 +513,100 @@ def quick_performance_check(db: Session = Depends(get_db)):
         "system_status": "Healthy" if total_users > 10 and total_interactions > 100 else "Needs More Data"
     }
 
+@app.get("/simple_evaluation")
+def simple_evaluation(test_users: int = 20, db: Session = Depends(get_db)):
+    """تقييم بسيط وواضح"""
+    
+    active_users = db.query(UserInteraction.user_id).distinct().limit(test_users).all()
+    
+    results = []
+    
+    for user_tuple in active_users:
+        user_id = user_tuple[0]
+        
+        # الحصول على تفاعلات المستخدم
+        user_interactions = db.query(UserInteraction).filter(
+            UserInteraction.user_id == user_id
+        ).all()
+        
+        if len(user_interactions) < 5:
+            continue
+        
+        # العناصر التي أحبها المستخدم (نقاط عالية)
+        liked_items = set()
+        for inter in user_interactions:
+            if inter.score >= 10.0:  # purchase فقط
+                liked_items.add(inter.coupon_id)
+        
+        if not liked_items:
+            continue
+        
+        # الحصول على التوصيات
+        recommendations_data = get_recommendations(user_id, 10, db)
+        recommended_items = set(recommendations_data["recommendations"])
+        
+        # حساب التطابق
+        matches = len(recommended_items.intersection(liked_items))
+        
+        # حساب المقاييس البسيطة
+        precision = matches / len(recommended_items) if recommended_items else 0
+        recall = matches / len(liked_items) if liked_items else 0
+        
+        results.append({
+            'user_id': user_id,
+            'liked_items_count': len(liked_items),
+            'recommended_items_count': len(recommended_items),
+            'matches': matches,
+            'precision': round(precision, 4),
+            'recall': round(recall, 4),
+            'user_categories': recommendations_data.get("user_categories", {})
+        })
+    
+    if results:
+        avg_precision = sum(r['precision'] for r in results) / len(results)
+        avg_recall = sum(r['recall'] for r in results) / len(results)
+        
+        return {
+            "simple_evaluation": {
+                "average_precision": round(avg_precision, 4),
+                "average_recall": round(avg_recall, 4),
+                "users_evaluated": len(results)
+            },
+            "results": results[:10]
+        }
+    
+    return {"error": "No valid users for evaluation"}
+
+@app.get("/debug_recommendations")
+def debug_recommendations(user_id: int, db: Session = Depends(get_db)):
+    """تشخيص مشكلة التوصيات"""
+    
+    # تفاعلات المستخدم
+    interactions = db.query(UserInteraction).filter(
+        UserInteraction.user_id == user_id
+    ).all()
+    
+    # الكوبونات المستبعدة
+    seen_coupons = set(inter.coupon_id for inter in interactions)
+    
+    # التوصيات
+    recommendations_data = get_recommendations(user_id, 10, db)
+    
+    # تحليل
+    return {
+        "user_id": user_id,
+        "total_interactions": len(interactions),
+        "seen_coupons": list(seen_coupons)[:10],
+        "seen_coupons_count": len(seen_coupons),
+        "recommendations": recommendations_data["recommendations"],
+        "user_categories": recommendations_data.get("user_categories", {}),
+        "problem_analysis": {
+            "excludes_all_interacted_items": True,
+            "this_causes_zero_overlap": True,
+            "solution": "Modify recommendation logic to allow some overlap"
+        }
+    }
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
