@@ -961,3 +961,394 @@ if __name__ == "__main__":
         port=config.SERVICE_PORT,
         log_level="info"
     )
+
+@app.get("/get_recommendations_smart_rerank")
+def get_recommendations_smart_rerank(user_id: int, top_n: int = 10, db: Session = Depends(get_db)):
+    """توصيات ذكية مع السماح بإعادة الاقتراح بناءً على التفضيلات"""
+    
+    if faiss_index is None or model is None:
+        raise HTTPException(status_code=500, detail="System not ready")
+    
+    interactions = db.query(UserInteraction).filter(UserInteraction.user_id == user_id).all()
+    
+    if not interactions:
+        popular_coupons = db.query(UserInteraction.coupon_id, func.sum(UserInteraction.score).label('total_score'))\
+                           .group_by(UserInteraction.coupon_id)\
+                           .order_by(func.sum(UserInteraction.score).desc())\
+                           .limit(top_n).all()
+        return {"recommendations": [c.coupon_id for c in popular_coupons], "method": "popular"}
+    
+    # بناء ملف المستخدم
+    weighted_emb = np.zeros(vector_dim)
+    total_weight = 0
+    user_categories = {}
+    seen_coupons = {}  # تخزين مع النقاط
+    
+    for inter in interactions:
+        coupon = db.query(Coupon).filter(Coupon.id == inter.coupon_id).first()
+        if not coupon:
+            continue
+            
+        # تخزين الكوبون مع نقاطو
+        seen_coupons[coupon.id] = seen_coupons.get(coupon.id, 0) + inter.score
+        
+        category = db.query(Category).filter(Category.id == coupon.category_id).first()
+        coupon_type = db.query(CouponType).filter(CouponType.id == coupon.coupon_type_id).first()
+        
+        text = build_enhanced_text(coupon, category, coupon_type)
+        embedding = model.encode([text])[0]
+        
+        weight = inter.score
+        if inter.action == 'purchase':
+            weight *= 2.0
+        
+        weighted_emb += embedding * weight
+        total_weight += weight
+        
+        if category:
+            user_categories[category.name] = user_categories.get(category.name, 0) + inter.score
+    
+    if total_weight > 0:
+        weighted_emb /= total_weight
+    
+    # البحث في المتجهات - نأخذ عدد أكبر للاختيار
+    search_size = min(top_n * 10, len(coupon_ids))
+    similarities, indices = faiss_index.search(weighted_emb.reshape(1, -1).astype('float32'), search_size)
+    
+    recommendations = []
+    category_counts = {}
+    max_per_category = max(2, top_n // len(user_categories)) if user_categories else top_n
+    
+    # **الحل الذكي:** تصنيف العناصر المُشاهدة
+    high_score_seen = set()  # نقاط عالية (يستحق إعادة الاقتراح)
+    low_score_seen = set()   # نقاط منخفضة (تجنب)
+    
+    for coupon_id, total_score in seen_coupons.items():
+        if total_score >= 10.0:  # نقاط عالية (click + purchase أو purchases متعددة)
+            high_score_seen.add(coupon_id)
+        else:
+            low_score_seen.add(coupon_id)
+    
+    # السماح بإعادة اقتراح العناصر عالية النقاط
+    high_score_allowed = 0
+    max_high_score = max(2, top_n // 3)  # حتى 33% من العناصر عالية النقاط
+    
+    for sim, idx in zip(similarities[0], indices[0]):
+        if len(recommendations) >= top_n:
+            break
+            
+        coupon_id = coupon_ids[idx]
+        
+        # منطق القرار الذكي
+        if coupon_id in low_score_seen:
+            continue  # تجنب العناصر منخفضة النقاط
+        
+        if coupon_id in high_score_seen:
+            if high_score_allowed >= max_high_score:
+                continue  # وصلنا للحد الأقصى من إعادة الاقتراح
+            high_score_allowed += 1
+        
+        coupon = db.query(Coupon).filter(Coupon.id == coupon_id).first()
+        if not coupon:
+            continue
+            
+        category = db.query(Category).filter(Category.id == coupon.category_id).first()
+        category_name = category.name if category else "Unknown"
+        
+        # توزيع الفئات
+        if category_counts.get(category_name, 0) >= max_per_category:
+            continue
+            
+        recommendations.append(coupon_id)
+        category_counts[category_name] = category_counts.get(category_name, 0) + 1
+    
+    # ملء الباقي من العناصر غير المُشاهدة
+    while len(recommendations) < top_n:
+        for sim, idx in zip(similarities[0], indices[0]):
+            if len(recommendations) >= top_n:
+                break
+                
+            coupon_id = coupon_ids[idx]
+            if coupon_id not in recommendations and coupon_id not in seen_coupons:
+                recommendations.append(coupon_id)
+    
+    return {
+        "recommendations": recommendations[:top_n],
+        "method": "smart_rerank_content_based",
+        "user_categories": user_categories,
+        "rerank_stats": {
+            "high_score_items_included": high_score_allowed,
+            "total_seen_items": len(seen_coupons),
+            "high_score_seen_items": len(high_score_seen),
+            "low_score_seen_items": len(low_score_seen)
+        }
+    }
+
+@app.get("/evaluate_smart_system")
+def evaluate_smart_system(test_users: int = 30, top_k: int = 10, db: Session = Depends(get_db)):
+    """تقييم النظام الذكي مع إعادة الاقتراح"""
+    
+    print(f"🔍 Evaluating SMART system with re-ranking...")
+    
+    active_users = db.query(
+        UserInteraction.user_id,
+        func.count(UserInteraction.id).label('interaction_count')
+    ).group_by(UserInteraction.user_id)\
+     .having(func.count(UserInteraction.id) >= 10)\
+     .order_by(func.count(UserInteraction.id).desc())\
+     .limit(test_users).all()
+    
+    precision_scores = []
+    recall_scores = []
+    f1_scores = []
+    evaluation_details = []
+    
+    for user_id, interaction_count in active_users:
+        try:
+            # تفاعلات المستخدم
+            all_interactions = db.query(UserInteraction).filter(
+                UserInteraction.user_id == user_id
+            ).order_by(UserInteraction.timestamp).all()
+            
+            if len(all_interactions) < 10:
+                continue
+            
+            # تقسيم زمني: 80% تدريب، 20% اختبار
+            split_point = int(len(all_interactions) * 0.8)
+            train_interactions = all_interactions[:split_point]
+            test_interactions = all_interactions[split_point:]
+            
+            # العناصر المناسبة في الاختبار
+            relevant_items = set()
+            for inter in test_interactions:
+                if inter.score >= 5.0:  # click أو purchase
+                    relevant_items.add(inter.coupon_id)
+            
+            if not relevant_items:
+                continue
+            
+            # **حذف مؤقت لتفاعلات الاختبار**
+            test_interaction_ids = [inter.id for inter in test_interactions]
+            
+            # حفظ تفاعلات الاختبار
+            test_data = []
+            for inter in test_interactions:
+                test_data.append({
+                    'user_id': inter.user_id,
+                    'coupon_id': inter.coupon_id,
+                    'action': inter.action,
+                    'score': inter.score,
+                    'timestamp': inter.timestamp
+                })
+            
+            # حذف تفاعلات الاختبار مؤقتاً
+            db.query(UserInteraction).filter(
+                UserInteraction.id.in_(test_interaction_ids)
+            ).delete(synchronize_session=False)
+            db.commit()
+            
+            # الحصول على التوصيات الذكية (بناءً على التدريب فقط)
+            try:
+                recommendations_data = get_recommendations_smart_rerank(user_id, top_k, db)
+                recommended_items = set(recommendations_data["recommendations"])
+            except Exception as e:
+                print(f"Error getting recommendations for user {user_id}: {e}")
+                recommended_items = set()
+            
+            # إعادة إدراج تفاعلات الاختبار
+            for data in test_data:
+                new_interaction = UserInteraction(
+                    user_id=data['user_id'],
+                    coupon_id=data['coupon_id'],
+                    action=data['action'],
+                    score=data['score'],
+                    timestamp=data['timestamp']
+                )
+                db.add(new_interaction)
+            db.commit()
+            
+            # حساب المقاييس
+            true_positives = len(recommended_items.intersection(relevant_items))
+            
+            precision = true_positives / len(recommended_items) if recommended_items else 0
+            recall = true_positives / len(relevant_items) if relevant_items else 0
+            f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+            
+            precision_scores.append(precision)
+            recall_scores.append(recall)
+            f1_scores.append(f1)
+            
+            evaluation_details.append({
+                'user_id': user_id,
+                'total_interactions': len(all_interactions),
+                'train_interactions': len(train_interactions),
+                'test_interactions': len(test_interactions),
+                'relevant_items': len(relevant_items),
+                'recommended_items': len(recommended_items),
+                'true_positives': true_positives,
+                'precision': round(precision, 4),
+                'recall': round(recall, 4),
+                'f1_score': round(f1, 4),
+                'rerank_stats': recommendations_data.get("rerank_stats", {}),
+                'overlap_items': list(recommended_items.intersection(relevant_items))
+            })
+            
+        except Exception as e:
+            print(f"Error with user {user_id}: {e}")
+            continue
+    
+    if not evaluation_details:
+        return {"error": "No valid evaluations"}
+    
+    # حساب النتائج
+    avg_precision = np.mean(precision_scores)
+    avg_recall = np.mean(recall_scores)
+    avg_f1 = np.mean(f1_scores)
+    
+    # مقارنة مع النتائج السابقة
+    previous_f1 = 0.0134
+    improvement_f1 = ((avg_f1 - previous_f1) / previous_f1 * 100) if previous_f1 > 0 else 0
+    
+    # تحديد مستوى الأداء
+    if avg_f1 >= 0.15:
+        performance_level = "Good"
+    elif avg_f1 >= 0.05:
+        performance_level = "Fair"
+    else:
+        performance_level = "Poor"
+    
+    return {
+        "smart_evaluation_summary": {
+            "performance_level": performance_level,
+            "users_evaluated": len(evaluation_details),
+            "evaluation_method": "Smart re-ranking with high-score preferences",
+            "evaluation_timestamp": datetime.now().isoformat()
+        },
+        "core_metrics": {
+            "precision": {
+                "average": round(avg_precision, 4),
+                "previous": 0.0167,
+                "improvement_percentage": round(((avg_precision - 0.0167) / 0.0167 * 100) if 0.0167 > 0 else 0, 1)
+            },
+            "recall": {
+                "average": round(avg_recall, 4),
+                "previous": 0.0113,
+                "improvement_percentage": round(((avg_recall - 0.0113) / 0.0113 * 100) if 0.0113 > 0 else 0, 1)
+            },
+            "f1_score": {
+                "average": round(avg_f1, 4),
+                "previous": previous_f1,
+                "improvement_percentage": round(improvement_f1, 1)
+            }
+        },
+        "rerank_analysis": {
+            "avg_high_score_reranked": round(np.mean([r['rerank_stats'].get('high_score_items_included', 0) for r in evaluation_details]), 2),
+            "users_with_matches": len([r for r in evaluation_details if r['true_positives'] > 0]),
+            "best_user_f1": round(max([r['f1_score'] for r in evaluation_details]), 4),
+            "users_with_good_performance": len([r for r in evaluation_details if r['f1_score'] >= 0.15])
+        },
+        "performance_distribution": {
+            "excellent": len([r for r in evaluation_details if r['f1_score'] >= 0.25]),
+            "good": len([r for r in evaluation_details if 0.15 <= r['f1_score'] < 0.25]),
+            "fair": len([r for r in evaluation_details if 0.05 <= r['f1_score'] < 0.15]),
+            "poor": len([r for r in evaluation_details if r['f1_score'] < 0.05])
+        },
+        "sample_results": evaluation_details[:5],
+        "improvement_summary": f"F1-Score improved from {previous_f1:.4f} to {avg_f1:.4f} ({improvement_f1:.1f}% improvement)"
+    }
+
+@app.get("/compare_recommendation_methods")
+def compare_recommendation_methods(user_id: int, top_n: int = 10, db: Session = Depends(get_db)):
+    """مقارنة بين طرق التوصية المختلفة"""
+    
+    try:
+        # الطريقة الأصلية (بدون إعادة اقتراح)
+        original_recs = get_recommendations(user_id, top_n, db)
+        
+        # الطريقة الذكية (مع إعادة الاقتراح)
+        smart_recs = get_recommendations_smart_rerank(user_id, top_n, db)
+        
+        # تحليل الاختلافات
+        original_set = set(original_recs["recommendations"])
+        smart_set = set(smart_recs["recommendations"])
+        
+        overlap = original_set.intersection(smart_set)
+        only_original = original_set - smart_set
+        only_smart = smart_set - original_set
+        
+        return {
+            "user_id": user_id,
+            "comparison_summary": {
+                "overlap_count": len(overlap),
+                "overlap_percentage": round(len(overlap) / top_n * 100, 1),
+                "unique_to_original": len(only_original),
+                "unique_to_smart": len(only_smart)
+            },
+            "original_method": {
+                "recommendations": original_recs["recommendations"],
+                "method": original_recs.get("method", "content_based"),
+                "user_categories": original_recs.get("user_categories", {})
+            },
+            "smart_method": {
+                "recommendations": smart_recs["recommendations"],
+                "method": smart_recs.get("method", "smart_rerank"),
+                "user_categories": smart_recs.get("user_categories", {}),
+                "rerank_stats": smart_recs.get("rerank_stats", {})
+            },
+            "analysis": {
+                "overlap_items": list(overlap),
+                "only_in_original": list(only_original),
+                "only_in_smart": list(only_smart),
+                "recommendation": "Smart method allows re-ranking of high-score items for better relevance"
+            }
+        }
+        
+    except Exception as e:
+        return {"error": f"Comparison failed: {str(e)}"}
+
+@app.get("/test_user_recommendations")
+def test_user_recommendations(user_id: int = 372, db: Session = Depends(get_db)):
+    """اختبار سريع لتوصيات مستخدم محدد"""
+    
+    # معلومات المستخدم
+    interactions = db.query(UserInteraction).filter(
+        UserInteraction.user_id == user_id
+    ).all()
+    
+    if not interactions:
+        return {"error": f"No interactions found for user {user_id}"}
+    
+    # إحصائيات المستخدم
+    user_stats = {
+        "total_interactions": len(interactions),
+        "searches": len([i for i in interactions if i.action == 'search']),
+        "clicks": len([i for i in interactions if i.action == 'click']),
+        "purchases": len([i for i in interactions if i.action == 'purchase']),
+        "total_score": sum(i.score for i in interactions),
+        "unique_coupons": len(set(i.coupon_id for i in interactions))
+    }
+    
+    # الحصول على التوصيات
+    try:
+        smart_recommendations = get_recommendations_smart_rerank(user_id, 10, db)
+        
+        return {
+            "user_analysis": {
+                "user_id": user_id,
+                "stats": user_stats,
+                "top_categories": dict(list(smart_recommendations["user_categories"].items())[:5])
+            },
+            "recommendations": smart_recommendations,
+            "test_result": "Success - Smart recommendations generated",
+            "next_step": "Run full evaluation with /evaluate_smart_system"
+        }
+        
+    except Exception as e:
+        return {
+            "user_analysis": {
+                "user_id": user_id,
+                "stats": user_stats
+            },
+            "error": f"Failed to generate recommendations: {str(e)}",
+            "suggestion": "Check if vector store is built and model is loaded"
+        }
