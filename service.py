@@ -1360,3 +1360,4 @@ def test_user_recommendations(user_id: int = 372, db: Session = Depends(get_db))
             },
             "error": f"Failed to generate recommendations: {str(e)}"
         }
+        
