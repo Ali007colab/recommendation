@@ -5,6 +5,7 @@ import json
 import logging
 import sys
 import os
+import re
 from datetime import datetime
 from typing import Dict, Any
 
@@ -66,15 +67,75 @@ class RabbitMQConsumer:
             logger.error(f"❌ Failed to connect to RabbitMQ: {e}")
             return False
     
+    def extract_laravel_job_data(self, raw_data: Dict[str, Any]) -> Dict[str, Any]:
+        """استخراج البيانات من Laravel Queue Job"""
+        try:
+            # التحقق من وجود هيكل Laravel Job
+            if 'data' in raw_data and 'command' in raw_data['data']:
+                command_string = raw_data['data']['command']
+                
+                # استخراج البيانات من PHP serialized object
+                # البحث عن interactionData في النص
+                match = re.search(r's:18:"\x00\*\x00interactionData";a:7:\{([^}]+)\}', command_string)
+                if match:
+                    # استخراج البيانات يدوياً من النص
+                    data_section = match.group(1)
+                    
+                    # استخراج القيم
+                    user_id_match = re.search(r's:7:"user_id";i:(\d+)', data_section)
+                    coupon_id_match = re.search(r's:9:"coupon_id";i:(\d+)', data_section)
+                    coupon_name_match = re.search(r's:11:"coupon_name";s:\d+:"([^"]+)"', data_section)
+                    coupon_category_match = re.search(r's:15:"coupon_category";s:\d+:"([^"]+)"', data_section)
+                    coupon_type_match = re.search(r's:11:"coupon_type";s:\d+:"([^"]+)"', data_section)
+                    coupon_description_match = re.search(r's:18:"coupon_description";s:\d+:"([^"]+)"', data_section)
+                    interaction_type_match = re.search(r's:16:"interaction_type";s:\d+:"([^"]+)"', data_section)
+                    
+                    # بناء البيانات المستخرجة
+                    extracted_data = {}
+                    
+                    if user_id_match:
+                        extracted_data['user_id'] = int(user_id_match.group(1))
+                    
+                    if coupon_id_match:
+                        extracted_data['coupon_id'] = int(coupon_id_match.group(1))
+                    
+                    if coupon_name_match:
+                        extracted_data['coupon_name'] = coupon_name_match.group(1)
+                    
+                    if coupon_category_match:
+                        extracted_data['coupon_category'] = coupon_category_match.group(1)
+                    
+                    if coupon_type_match:
+                        extracted_data['coupon_type'] = coupon_type_match.group(1)
+                    
+                    if coupon_description_match:
+                        extracted_data['coupon_description'] = coupon_description_match.group(1)
+                    
+                    if interaction_type_match:
+                        extracted_data['interaction_type'] = interaction_type_match.group(1)
+                    
+                    logger.info(f"📦 Extracted Laravel job data: {extracted_data}")
+                    return extracted_data
+            
+            # إذا لم تكن Laravel job، إرجاع البيانات كما هي
+            return raw_data
+            
+        except Exception as e:
+            logger.error(f"❌ Error extracting Laravel job data: {e}")
+            return raw_data
+    
     async def process_interaction_message(self, message: aio_pika.IncomingMessage):
         """معالجة رسالة التفاعل"""
         async with message.process():
             try:
                 # فك تشفير الرسالة
                 body = message.body.decode('utf-8')
-                data = json.loads(body)
+                raw_data = json.loads(body)
                 
-                logger.info(f"📨 Received interaction: {data}")
+                logger.info(f"📨 Received raw message from Laravel")
+                
+                # استخراج البيانات من Laravel Job
+                data = self.extract_laravel_job_data(raw_data)
                 
                 # معالجة البيانات وحفظها
                 success = await self.save_interaction_data(data)
@@ -107,8 +168,10 @@ class RabbitMQConsumer:
                 
                 # التحقق من البيانات المطلوبة
                 if not all([user_id, coupon_id, interaction_type]):
-                    logger.error("❌ Missing required fields: user_id, coupon_id, or interaction_type")
+                    logger.error(f"❌ Missing required fields. Received: user_id={user_id}, coupon_id={coupon_id}, interaction_type={interaction_type}")
                     return False
+                
+                logger.info(f"💾 Processing interaction: User {user_id} -> Coupon {coupon_id} ({interaction_type})")
                 
                 # البحث عن الفئة أو إنشاؤها
                 category = None
