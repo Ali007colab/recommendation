@@ -939,7 +939,99 @@ def simple_evaluation(test_users: int = 30, db: Session = Depends(get_db)):
         }
     }
 
-# النهاية - يجب أن يكون هذا آخر شيء في الملف
+@app.get("/rabbitmq_status")
+async def rabbitmq_status():
+    """فحص حالة اتصال RabbitMQ"""
+    try:
+        import aio_pika
+        
+        # محاولة الاتصال
+        connection = await aio_pika.connect_robust(
+            host=config.RABBITMQ_HOST,
+            port=config.RABBITMQ_PORT,
+            login=config.RABBITMQ_USER,
+            password=config.RABBITMQ_PASSWORD,
+            virtualhost=config.RABBITMQ_VHOST,
+            timeout=5  # مهلة زمنية قصيرة للاختبار
+        )
+        
+        await connection.close()
+        
+        return {
+            "status": "connected",
+            "host": config.RABBITMQ_HOST,
+            "port": config.RABBITMQ_PORT,
+            "message": "RabbitMQ connection successful"
+        }
+        
+    except Exception as e:
+        return {
+            "status": "disconnected",
+            "host": config.RABBITMQ_HOST,
+            "port": config.RABBITMQ_PORT,
+            "error": str(e),
+            "message": "RabbitMQ connection failed"
+        }
+
+@app.post("/test_rabbitmq_send")
+async def test_rabbitmq_send():
+    """إرسال رسالة تجريبية إلى RabbitMQ"""
+    try:
+        import aio_pika
+        import json
+        from datetime import datetime
+        
+        # الاتصال بـ RabbitMQ
+        connection = await aio_pika.connect_robust(
+            host=config.RABBITMQ_HOST,
+            port=config.RABBITMQ_PORT,
+            login=config.RABBITMQ_USER,
+            password=config.RABBITMQ_PASSWORD,
+            virtualhost=config.RABBITMQ_VHOST
+        )
+        
+        channel = await connection.channel()
+        
+        # إنشاء Exchange
+        exchange = await channel.declare_exchange(
+            'interaction_exchange',
+            aio_pika.ExchangeType.TOPIC,
+            durable=True
+        )
+        
+        # بيانات تجريبية
+        test_data = {
+            "user_id": 999,
+            "coupon_id": 1,
+            "coupon_name": "Test Coupon from API",
+            "coupon_category": "Test Category",
+            "coupon_type": "Test Type",
+            "coupon_description": "This is a test message from FastAPI",
+            "interaction_type": "click",
+            "timestamp": datetime.now().isoformat()
+        }
+        
+        # إرسال الرسالة
+        message = aio_pika.Message(
+            json.dumps(test_data).encode('utf-8'),
+            delivery_mode=aio_pika.DeliveryMode.PERSISTENT
+        )
+        
+        await exchange.publish(message, routing_key='user.interaction')
+        await connection.close()
+        
+        return {
+            "status": "success",
+            "message": "Test message sent to RabbitMQ",
+            "data": test_data
+        }
+        
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": f"Failed to send test message: {str(e)}"
+        }
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(

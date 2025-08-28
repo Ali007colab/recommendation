@@ -54,5 +54,10 @@ def get_db():
     finally:
         db.close()
 
+# إضافة دالة جديدة للـ RabbitMQ Consumer
+def get_db_session():
+    """إنشاء جلسة قاعدة بيانات جديدة للاستخدام خارج FastAPI"""
+    return SessionLocal()
+
 def create_tables():
     Base.metadata.create_all(bind=engine)
