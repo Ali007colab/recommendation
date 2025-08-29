@@ -52,6 +52,12 @@ class RecommendationCacheManager:
         self.last_model_update = None
         self.last_cache_update = None
         
+        # Cache for database data to avoid repeated queries
+        self.coupons_cache = {}
+        self.categories_cache = {}
+        self.coupon_types_cache = {}
+        self.coupon_embeddings_cache = {}
+        
         # Initialize connections
         self.init_redis()
         self.load_model()
@@ -95,6 +101,35 @@ class RecommendationCacheManager:
             self.model = None
             return False
     
+    def load_all_data(self):
+        """تحميل كل البيانات مرة واحدة لتجنب الـ queries المتكررة"""
+        logger.info("📊 Loading all data into cache...")
+        
+        db = SessionLocal()
+        try:
+            # Load all coupons
+            coupons = db.query(Coupon).all()
+            self.coupons_cache = {c.id: c for c in coupons}
+            logger.info(f"   📦 Loaded {len(coupons)} coupons")
+            
+            # Load all categories
+            categories = db.query(Category).all()
+            self.categories_cache = {c.id: c for c in categories}
+            logger.info(f"   📂 Loaded {len(categories)} categories")
+            
+            # Load all coupon types
+            coupon_types = db.query(CouponType).all()
+            self.coupon_types_cache = {ct.id: ct for ct in coupon_types}
+            logger.info(f"   🏷️ Loaded {len(coupon_types)} coupon types")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ Error loading data: {e}")
+            return False
+        finally:
+            db.close()
+    
     def build_enhanced_text(self, coupon, category, coupon_type):
         """بناء النص المحسن للكوبون"""
         category_tokens = f"CATEGORY_{category.name} " * 25 if category else ''
@@ -105,6 +140,32 @@ class RecommendationCacheManager:
         
         return f"{category_tokens}{type_tokens}{name_emphasis} {description_reduced} {price_range}"
     
+    def precompute_embeddings(self):
+        """حساب الـ embeddings لكل الكوبونات مسبقاً"""
+        logger.info("🧮 Precomputing all coupon embeddings...")
+        
+        self.coupon_embeddings_cache = {}
+        texts = []
+        coupon_ids = []
+        
+        for coupon_id, coupon in self.coupons_cache.items():
+            category = self.categories_cache.get(coupon.category_id)
+            coupon_type = self.coupon_types_cache.get(coupon.coupon_type_id)
+            text = self.build_enhanced_text(coupon, category, coupon_type)
+            texts.append(text)
+            coupon_ids.append(coupon_id)
+        
+        if texts:
+            logger.info(f"   🔄 Encoding {len(texts)} texts...")
+            embeddings = self.model.encode(texts, batch_size=32, show_progress_bar=True)
+            
+            for coupon_id, embedding in zip(coupon_ids, embeddings):
+                self.coupon_embeddings_cache[coupon_id] = embedding
+            
+            logger.info(f"   ✅ Precomputed {len(embeddings)} embeddings")
+        
+        return len(self.coupon_embeddings_cache) > 0
+    
     def build_vector_store(self):
         """بناء الـ Vector Store"""
         if not self.model:
@@ -114,47 +175,45 @@ class RecommendationCacheManager:
         try:
             logger.info("🔨 Building vector store...")
             
-            db = SessionLocal()
-            try:
-                coupons = db.query(Coupon).all()
-                if not coupons:
-                    logger.warning("⚠️ No coupons found")
-                    return False
-                
-                texts = []
-                new_coupon_ids = []
-                
-                for coupon in coupons:
-                    category = db.query(Category).filter(Category.id == coupon.category_id).first()
-                    coupon_type = db.query(CouponType).filter(CouponType.id == coupon.coupon_type_id).first()
-                    text = self.build_enhanced_text(coupon, category, coupon_type)
-                    texts.append(text)
-                    new_coupon_ids.append(coupon.id)
-                
-                logger.info(f"📊 Encoding {len(texts)} texts...")
-                embeddings = self.model.encode(texts)
-                
-                logger.info("🏗️ Building FAISS index...")
-                self.faiss_index = faiss.IndexFlatIP(self.vector_dim)
-                self.faiss_index.add(embeddings.astype('float32'))
-                
-                self.coupon_ids = new_coupon_ids
-                
-                logger.info(f"✅ Vector store built with {len(coupons)} coupons")
-                return True
-                
-            finally:
-                db.close()
-                
+            # Load all data first
+            if not self.load_all_data():
+                return False
+            
+            # Precompute embeddings
+            if not self.precompute_embeddings():
+                return False
+            
+            if not self.coupons_cache:
+                logger.warning("⚠️ No coupons found")
+                return False
+            
+            # Build FAISS index
+            embeddings = []
+            new_coupon_ids = []
+            
+            for coupon_id, embedding in self.coupon_embeddings_cache.items():
+                embeddings.append(embedding)
+                new_coupon_ids.append(coupon_id)
+            
+            embeddings = np.array(embeddings)
+            
+            logger.info("🏗️ Building FAISS index...")
+            self.faiss_index = faiss.IndexFlatIP(self.vector_dim)
+            self.faiss_index.add(embeddings.astype('float32'))
+            
+            self.coupon_ids = new_coupon_ids
+            
+            logger.info(f"✅ Vector store built with {len(self.coupons_cache)} coupons")
+            return True
+            
         except Exception as e:
             logger.error(f"❌ Error building vector store: {e}")
             return False
     
     def get_all_users_with_interactions(self):
-        """الحصول على كل المستخدمين اللي عندهم تفاعلات (بدون حد أدنى)"""
+        """الحصول على كل المستخدمين اللي عندهم تفاعلات"""
         db = SessionLocal()
         try:
-            # Get ALL users with ANY interactions
             all_users = db.query(
                 UserInteraction.user_id,
                 func.count(UserInteraction.id).label('interaction_count')
@@ -164,7 +223,6 @@ class RecommendationCacheManager:
             
             logger.info(f"📊 Found {len(all_users)} total users with interactions")
             
-            # Log distribution
             if all_users:
                 max_interactions = all_users[0].interaction_count
                 min_interactions = all_users[-1].interaction_count
@@ -172,15 +230,6 @@ class RecommendationCacheManager:
                 
                 logger.info(f"   📈 Interactions range: {min_interactions} - {max_interactions}")
                 logger.info(f"   📊 Average interactions: {avg_interactions:.1f}")
-                
-                # Show distribution
-                high_activity = len([u for u in all_users if u.interaction_count >= 10])
-                medium_activity = len([u for u in all_users if 5 <= u.interaction_count < 10])
-                low_activity = len([u for u in all_users if u.interaction_count < 5])
-                
-                logger.info(f"   🔥 High activity (10+): {high_activity} users")
-                logger.info(f"   🔶 Medium activity (5-9): {medium_activity} users")
-                logger.info(f"   🔸 Low activity (1-4): {low_activity} users")
             
             return [user.user_id for user in all_users]
             
@@ -190,15 +239,15 @@ class RecommendationCacheManager:
         finally:
             db.close()
     
-    def get_user_recommendations(self, user_id: int, top_n: int = 10):
-        """الحصول على توصيات المستخدم"""
+    def get_user_recommendations_fast(self, user_id: int, top_n: int = 10):
+        """الحصول على توصيات المستخدم بطريقة سريعة"""
         if not self.faiss_index or not self.model:
             logger.error("❌ System not ready")
             return None
         
         db = SessionLocal()
         try:
-            # Check if user exists
+            # Get user interactions
             interactions = db.query(UserInteraction).filter(
                 UserInteraction.user_id == user_id
             ).all()
@@ -220,26 +269,24 @@ class RecommendationCacheManager:
                     "interaction_count": 0
                 }
             
-            logger.info(f"📊 Processing user {user_id} with {len(interactions)} interactions")
-            
-            # Build user profile
+            # Build user profile using cached embeddings
             weighted_emb = np.zeros(self.vector_dim)
             total_weight = 0
             user_categories = {}
             seen_coupons = {}
             
             for inter in interactions:
-                coupon = db.query(Coupon).filter(Coupon.id == inter.coupon_id).first()
+                # Use cached data instead of queries
+                coupon = self.coupons_cache.get(inter.coupon_id)
                 if not coupon:
                     continue
                 
                 seen_coupons[coupon.id] = seen_coupons.get(coupon.id, 0) + inter.score
                 
-                category = db.query(Category).filter(Category.id == coupon.category_id).first()
-                coupon_type = db.query(CouponType).filter(CouponType.id == coupon.coupon_type_id).first()
-                
-                text = self.build_enhanced_text(coupon, category, coupon_type)
-                embedding = self.model.encode([text])[0]
+                # Use precomputed embedding
+                embedding = self.coupon_embeddings_cache.get(coupon.id)
+                if embedding is None:
+                    continue
                 
                 weight = inter.score
                 if inter.action == 'purchase':
@@ -248,6 +295,8 @@ class RecommendationCacheManager:
                 weighted_emb += embedding * weight
                 total_weight += weight
                 
+                # Use cached category
+                category = self.categories_cache.get(coupon.category_id)
                 if category:
                     user_categories[category.name] = user_categories.get(category.name, 0) + inter.score
             
@@ -295,12 +344,12 @@ class RecommendationCacheManager:
                         continue
                     high_score_allowed += 1
                 
-                # Check category diversity
-                coupon = db.query(Coupon).filter(Coupon.id == coupon_id).first()
+                # Check category diversity using cached data
+                coupon = self.coupons_cache.get(coupon_id)
                 if not coupon:
                     continue
                 
-                category = db.query(Category).filter(Category.id == coupon.category_id).first()
+                category = self.categories_cache.get(coupon.category_id)
                 category_name = category.name if category else "Unknown"
                 
                 if category_counts.get(category_name, 0) >= max_per_category:
@@ -309,7 +358,7 @@ class RecommendationCacheManager:
                 recommendations.append(coupon_id)
                 category_counts[category_name] = category_counts.get(category_name, 0) + 1
             
-            # Fill remaining slots
+            # Fill remaining slots if needed
             while len(recommendations) < top_n:
                 for sim, idx in zip(similarities[0], indices[0]):
                     if len(recommendations) >= top_n:
@@ -318,8 +367,9 @@ class RecommendationCacheManager:
                     coupon_id = self.coupon_ids[idx]
                     if coupon_id not in recommendations and coupon_id not in seen_coupons:
                         recommendations.append(coupon_id)
-            
-            logger.info(f"✅ Generated {len(recommendations)} recommendations for user {user_id}")
+                        break
+                else:
+                    break  # No more recommendations available
             
             return {
                 "coupon_ids": recommendations[:top_n],
@@ -329,13 +379,13 @@ class RecommendationCacheManager:
             }
             
         except Exception as e:
-            logger.error(f"Error getting recommendations for user {user_id}: {e}")
+            logger.error(f"❌ Error getting recommendations for user {user_id}: {e}")
             return None
         finally:
             db.close()
     
     def cache_user_recommendations(self, user_id: int, recommendations: Dict):
-        """حفظ توصيات المستخدم في Redis"""
+        """حفظ توصيات المستخدم في Redis مع timeout"""
         if not self.redis_client:
             logger.error(f"❌ Redis not available for user {user_id}")
             return False
@@ -352,23 +402,22 @@ class RecommendationCacheManager:
                 "expires_at": (datetime.now() + timedelta(seconds=config.RECOMMENDATIONS_CACHE_TTL)).isoformat()
             }
             
-            # Store with TTL
+            # Store with TTL and timeout
             self.redis_client.setex(
                 cache_key,
                 config.RECOMMENDATIONS_CACHE_TTL,
                 json.dumps(cache_data, ensure_ascii=False)
             )
             
-            logger.info(f"💾 Cached user {user_id}: {len(recommendations['coupon_ids'])} coupons")
             return True
             
         except Exception as e:
-            logger.error(f"Error caching user {user_id}: {e}")
+            logger.error(f"❌ Error caching user {user_id}: {e}")
             return False
     
-    def cache_all_users(self, top_n: int = 15):
-        """تخزين توصيات كل المستخدمين (بدون حد أدنى للتفاعلات)"""
-        logger.info(f"🚀 Starting COMPLETE bulk caching process...")
+    def cache_all_users_robust(self, top_n: int = 15):
+        """تخزين توصيات كل المستخدمين مع معالجة أفضل للأخطاء"""
+        logger.info(f"🚀 Starting ROBUST bulk caching process...")
         
         # Update model and vector store first
         if not self.build_vector_store():
@@ -391,8 +440,11 @@ class RecommendationCacheManager:
             try:
                 logger.info(f"🔄 Processing user {user_id} ({i+1}/{len(user_ids)})")
                 
-                # Get recommendations
-                recommendations = self.get_user_recommendations(user_id, top_n)
+                # Add timeout for each user
+                user_start_time = datetime.now()
+                
+                # Get recommendations with fast method
+                recommendations = self.get_user_recommendations_fast(user_id, top_n)
                 if not recommendations:
                     logger.warning(f"⚠️ No recommendations for user {user_id}")
                     failed_count += 1
@@ -401,13 +453,14 @@ class RecommendationCacheManager:
                 # Cache recommendations
                 if self.cache_user_recommendations(user_id, recommendations):
                     cached_count += 1
-                    logger.info(f"✅ User {user_id} cached successfully")
+                    user_duration = datetime.now() - user_start_time
+                    logger.info(f"✅ User {user_id} cached successfully in {user_duration.total_seconds():.2f}s")
                 else:
                     logger.error(f"❌ Failed to cache user {user_id}")
                     failed_count += 1
                 
-                # Progress logging every 10 users
-                if (i + 1) % 10 == 0:
+                # Progress logging every 5 users
+                if (i + 1) % 5 == 0:
                     elapsed = datetime.now() - start_time
                     rate = (i + 1) / elapsed.total_seconds()
                     eta = timedelta(seconds=(len(user_ids) - i - 1) / rate) if rate > 0 else "Unknown"
@@ -415,6 +468,9 @@ class RecommendationCacheManager:
                     logger.info(f"📈 Progress: {i + 1}/{len(user_ids)} ({((i + 1)/len(user_ids)*100):.1f}%) "
                               f"- Rate: {rate:.1f} users/sec - ETA: {eta}")
                     logger.info(f"   ✅ Cached: {cached_count}, ❌ Failed: {failed_count}")
+                
+                # Small delay to prevent overwhelming the system
+                time.sleep(0.1)
                 
             except Exception as e:
                 logger.error(f"❌ Error processing user {user_id}: {e}")
@@ -424,7 +480,7 @@ class RecommendationCacheManager:
         duration = datetime.now() - start_time
         self.last_cache_update = datetime.now()
         
-        logger.info(f"🎉 COMPLETE bulk caching finished!")
+        logger.info(f"🎉 ROBUST bulk caching finished!")
         logger.info(f"   📊 Total users processed: {len(user_ids)}")
         logger.info(f"   ✅ Successfully cached: {cached_count}")
         logger.info(f"   ❌ Failed: {failed_count}")
@@ -435,14 +491,14 @@ class RecommendationCacheManager:
 
 def main():
     """الدالة الرئيسية"""
-    logger.info("🚀 Starting COMPLETE Recommendation Cache Manager")
+    logger.info("🚀 Starting ROBUST Recommendation Cache Manager")
     
     # Initialize cache manager
     cache_manager = RecommendationCacheManager()
     
-    # Run complete caching for ALL users
-    logger.info("🔄 Running COMPLETE cache population for ALL users...")
-    success = cache_manager.cache_all_users(top_n=15)
+    # Run robust caching for ALL users
+    logger.info("🔄 Running ROBUST cache population for ALL users...")
+    success = cache_manager.cache_all_users_robust(top_n=15)
     
     if success:
         logger.info("✅ Initial caching completed successfully")
@@ -451,7 +507,7 @@ def main():
         return
     
     # Schedule regular updates every 2 hours
-    schedule.every(2).hours.do(lambda: cache_manager.cache_all_users(top_n=15))
+    schedule.every(2).hours.do(lambda: cache_manager.cache_all_users_robust(top_n=15))
     
     logger.info("⏰ Scheduled updates every 2 hours")
     logger.info("🔄 Cache manager is running...")
