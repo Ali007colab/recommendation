@@ -3,9 +3,7 @@
 import logging
 import sys
 import os
-import asyncio
-import threading
-from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks
+from fastapi import FastAPI, Depends, HTTPException
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 import numpy as np
@@ -13,9 +11,6 @@ from sentence_transformers import SentenceTransformer
 import faiss
 from datetime import datetime, timedelta
 from collections import defaultdict
-from apscheduler.schedulers.background import BackgroundScheduler
-from apscheduler.triggers.interval import IntervalTrigger
-import atexit
 
 # Set cache directories before importing sentence_transformers
 os.environ['TRANSFORMERS_CACHE'] = '/tmp/transformers_cache'
@@ -43,7 +38,6 @@ faiss_index = None
 coupon_ids = []
 vector_dim = config.VECTOR_DIM
 last_vector_build = None
-scheduler = None
 
 def build_enhanced_text(coupon, category, coupon_type):
     category_tokens = f"CATEGORY_{category.name} " * 25 if category else ''
@@ -75,90 +69,6 @@ def ensure_model_loaded():
     
     return True
 
-def build_vector_store_background():
-    """بناء الـ Vector Store في الخلفية"""
-    global faiss_index, coupon_ids, last_vector_build
-    
-    try:
-        logger.info("🔨 Building vector store in background...")
-        
-        # Ensure model is loaded
-        if not ensure_model_loaded():
-            logger.error("❌ Cannot build vector store: Model not loaded")
-            return False
-        
-        # Get database session
-        from database import SessionLocal
-        db = SessionLocal()
-        
-        try:
-            coupons = db.query(Coupon).all()
-            if not coupons:
-                logger.warning("⚠️ No coupons found for vector store")
-                return False
-            
-            texts = []
-            new_coupon_ids = []
-            
-            for coupon in coupons:
-                category = db.query(Category).filter(Category.id == coupon.category_id).first()
-                coupon_type = db.query(CouponType).filter(CouponType.id == coupon.coupon_type_id).first()
-                text = build_enhanced_text(coupon, category, coupon_type)
-                texts.append(text)
-                new_coupon_ids.append(coupon.id)
-            
-            logger.info(f"📊 Encoding {len(texts)} texts...")
-            embeddings = model.encode(texts)
-            
-            logger.info("🏗️ Building FAISS index...")
-            new_faiss_index = faiss.IndexFlatIP(vector_dim)
-            new_faiss_index.add(embeddings.astype('float32'))
-            
-            # Update global variables atomically
-            faiss_index = new_faiss_index
-            coupon_ids = new_coupon_ids
-            last_vector_build = datetime.now()
-            
-            logger.info(f"✅ Vector store built successfully with {len(coupons)} coupons")
-            return True
-            
-        finally:
-            db.close()
-            
-    except Exception as e:
-        logger.error(f"❌ Error building vector store: {e}")
-        return False
-
-def start_scheduler():
-    """بدء الجدولة التلقائية"""
-    global scheduler
-    
-    scheduler = BackgroundScheduler()
-    
-    # بناء الـ Vector Store كل ساعتين
-    scheduler.add_job(
-        func=build_vector_store_background,
-        trigger=IntervalTrigger(hours=2),
-        id='build_vector_store',
-        name='Build Vector Store Every 2 Hours',
-        replace_existing=True
-    )
-    
-    # فحص المودل كل 30 دقيقة
-    scheduler.add_job(
-        func=ensure_model_loaded,
-        trigger=IntervalTrigger(minutes=30),
-        id='check_model',
-        name='Check Model Every 30 Minutes',
-        replace_existing=True
-    )
-    
-    scheduler.start()
-    logger.info("⏰ Scheduler started - Vector store will rebuild every 2 hours")
-    
-    # Ensure scheduler shuts down when the application exits
-    atexit.register(lambda: scheduler.shutdown())
-
 @app.on_event("startup")
 async def startup_event():
     global model, last_vector_build
@@ -172,23 +82,11 @@ async def startup_event():
     
     # Load model with better error handling
     if ensure_model_loaded():
-        # Build initial vector store
-        if build_vector_store_background():
-            logger.info("✅ Initial vector store built")
-        else:
-            logger.warning("⚠️ Initial vector store build failed")
+        logger.info("✅ Model loaded successfully")
+    else:
+        logger.warning("⚠️ Model loading failed - you can try loading it manually via /load_model")
     
-    # Start the scheduler
-    start_scheduler()
-    
-    logger.info("✅ Service started with automatic vector store rebuilding")
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    global scheduler
-    if scheduler:
-        scheduler.shutdown()
-        logger.info("⏰ Scheduler stopped")
+    logger.info("✅ Service started")
 
 @app.get("/")
 def root():
@@ -198,8 +96,7 @@ def root():
         "status": "🟢 running",
         "model_loaded": "✅" if model else "❌",
         "vector_store_built": "✅" if faiss_index else "❌",
-        "last_vector_build": last_vector_build.isoformat() if last_vector_build else "Never",
-        "next_rebuild": "Every 2 hours automatically"
+        "last_vector_build": last_vector_build.isoformat() if last_vector_build else "Never"
     }
 
 @app.get("/health")
@@ -209,13 +106,27 @@ def health_check():
         "timestamp": datetime.utcnow(),
         "model_status": "loaded" if model else "not_loaded",
         "vector_store_status": "built" if faiss_index is not None else "not_built",
-        "last_vector_build": last_vector_build.isoformat() if last_vector_build else None,
-        "scheduler_running": scheduler.running if scheduler else False
+        "last_vector_build": last_vector_build.isoformat() if last_vector_build else None
     }
+
+@app.post("/load_model")
+def load_model():
+    """تحميل المودل يدوياً"""
+    success = ensure_model_loaded()
+    
+    if success:
+        return {
+            "status": "success",
+            "message": "Model loaded successfully",
+            "model_name": config.MODEL_NAME,
+            "vector_dim": vector_dim
+        }
+    else:
+        raise HTTPException(status_code=500, detail="Failed to load model")
 
 @app.post("/build_vector_store")
 def build_vector_store(db: Session = Depends(get_db)):
-    global faiss_index, coupon_ids
+    global faiss_index, coupon_ids, last_vector_build
     
     if model is None:
         raise HTTPException(status_code=500, detail="Model not loaded")
@@ -243,38 +154,40 @@ def build_vector_store(db: Session = Depends(get_db)):
     faiss_index = faiss.IndexFlatIP(vector_dim)
     faiss_index.add(embeddings.astype('float32'))
     
+    last_vector_build = datetime.now()
+    
     logger.info(f"✅ Vector store built with {len(coupons)} coupons")
-    return {"message": f"Vector store built with {len(coupons)} coupons"}
+    return {
+        "message": f"Vector store built with {len(coupons)} coupons",
+        "timestamp": last_vector_build.isoformat()
+    }
 
-@app.post("/force_rebuild_vector_store")
-def force_rebuild_vector_store():
-    """إجبار إعادة بناء الـ Vector Store فوراً"""
-    success = build_vector_store_background()
+@app.get("/user/{user_id}/recommended_coupon_ids")
+def get_user_recommended_coupon_ids_only(
+    user_id: int, 
+    top_n: int = 10,
+    db: Session = Depends(get_db)
+):
+    """الحصول على معرفات الكوبونات المقترحة فقط"""
     
-    if success:
+    if faiss_index is None or model is None:
+        raise HTTPException(status_code=500, detail="System not ready - please build vector store first")
+    
+    try:
+        # Use your existing recommendation logic
+        recommendations_data = get_recommendations_smart_rerank(user_id, top_n, db)
+        
         return {
-            "message": "Vector store rebuilt successfully",
-            "timestamp": last_vector_build.isoformat(),
-            "coupon_count": len(coupon_ids)
+            "user_id": user_id,
+            "coupon_ids": recommendations_data["recommendations"],
+            "count": len(recommendations_data["recommendations"]),
+            "method": recommendations_data.get("method", "smart_rerank"),
+            "timestamp": datetime.now().isoformat()
         }
-    else:
-        raise HTTPException(status_code=500, detail="Failed to rebuild vector store")
-
-@app.post("/log_event")
-def log_event(user_id: int, coupon_id: int, action: str, db: Session = Depends(get_db)):
-    score = {'search': 2.0, 'click': 5.0, 'purchase': 15.0}.get(action, 1.0)
-    
-    interaction = UserInteraction(
-        user_id=user_id,
-        coupon_id=coupon_id,
-        action=action,
-        score=score
-    )
-    
-    db.add(interaction)
-    db.commit()
-    
-    return {"message": "Event logged successfully", "score": score}
+        
+    except Exception as e:
+        logger.error(f"Error getting coupon IDs for user {user_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get recommendations: {str(e)}")
 
 @app.get("/get_recommendations")
 def get_recommendations(user_id: int, top_n: int = 10, db: Session = Depends(get_db)):
@@ -1183,40 +1096,6 @@ async def test_rabbitmq_send():
             "message": f"Failed to send test message: {str(e)}"
         }
 
-@app.post("/load_model")
-def load_model():
-    """Manually load the sentence transformer model"""
-    global model
-    
-    try:
-        logger.info("🔄 Manually loading sentence transformer model...")
-        logger.info(f"Model name: {config.MODEL_NAME}")
-        
-        # Try to load the model
-        model = SentenceTransformer(config.MODEL_NAME)
-        
-        # Test the model with a simple encoding
-        test_text = "test sentence"
-        test_embedding = model.encode([test_text])
-        logger.info(f"✅ Model loaded successfully! Test embedding shape: {test_embedding.shape}")
-        
-        return {
-            "status": "success",
-            "message": "Model loaded successfully",
-            "model_name": config.MODEL_NAME,
-            "test_embedding_shape": test_embedding.shape,
-            "vector_dim": vector_dim
-        }
-        
-    except Exception as e:
-        logger.error(f"❌ Model loading failed: {str(e)}")
-        return {
-            "status": "error",
-            "message": f"Model loading failed: {str(e)}",
-            "model_name": config.MODEL_NAME,
-            "suggestion": "Check internet connectivity and available memory"
-        }
-
 @app.get("/user/{user_id}/recommended_coupons")
 def get_user_recommended_coupons(
     user_id: int, 
@@ -1318,41 +1197,6 @@ def get_user_recommended_coupons(
         logger.error(f"Error getting recommendations for user {user_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to get recommendations: {str(e)}")
 
-@app.get("/user/{user_id}/recommended_coupon_ids")
-def get_user_recommended_coupon_ids_only(
-    user_id: int, 
-    top_n: int = 10,
-    db: Session = Depends(get_db)
-):
-    """
-    الحصول على معرفات الكوبونات المقترحة فقط (استجابة سريعة)
-    
-    Args:
-        user_id: معرف المستخدم
-        top_n: عدد التوصيات المطلوبة
-    
-    Returns:
-        قائمة بمعرفات الكوبونات المقترحة فقط
-    """
-    
-    if faiss_index is None or model is None:
-        raise HTTPException(status_code=500, detail="System not ready")
-    
-    try:
-        recommendations_data = get_recommendations_smart_rerank(user_id, top_n, db)
-        
-        return {
-            "user_id": user_id,
-            "coupon_ids": recommendations_data["recommendations"],
-            "count": len(recommendations_data["recommendations"]),
-            "method": recommendations_data.get("method", "smart_rerank"),
-            "timestamp": datetime.now().isoformat()
-        }
-        
-    except Exception as e:
-        logger.error(f"Error getting coupon IDs for user {user_id}: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to get recommendations: {str(e)}")
-
 @app.get("/system/status")
 def get_system_status():
     """فحص حالة النظام الشاملة"""
@@ -1388,8 +1232,8 @@ def get_system_status():
             "auto_rebuild": "Every 2 hours"
         },
         "scheduler": {
-            "running": scheduler.running if scheduler else False,
-            "jobs": len(scheduler.get_jobs()) if scheduler else 0
+            "running": False, # Scheduler is removed, so it's always False
+            "jobs": 0
         },
         "database": {
             "total_coupons": total_coupons,
