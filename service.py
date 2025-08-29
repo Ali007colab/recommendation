@@ -168,26 +168,134 @@ def get_user_recommended_coupon_ids_only(
     top_n: int = 10,
     db: Session = Depends(get_db)
 ):
-    """الحصول على معرفات الكوبونات المقترحة فقط"""
+    """الحصول على معرفات الكوبونات المقترحة فقط مع التحقق من وجود المستخدم"""
     
     if faiss_index is None or model is None:
         raise HTTPException(status_code=500, detail="System not ready - please build vector store first")
     
     try:
-        # Use your existing recommendation logic
+        # أولاً: فحص إذا المستخدم موجود في النظام
+        user_exists = db.query(UserInteraction).filter(
+            UserInteraction.user_id == user_id
+        ).first() is not None
+        
+        if not user_exists:
+            raise HTTPException(
+                status_code=404, 
+                detail=f"User {user_id} not found in the system. No interactions recorded for this user."
+            )
+        
+        # ثانياً: الحصول على التوصيات
         recommendations_data = get_recommendations_smart_rerank(user_id, top_n, db)
+        
+        # ثالثاً: إضافة معلومات إضافية عن المستخدم
+        user_interactions = db.query(UserInteraction).filter(
+            UserInteraction.user_id == user_id
+        ).all()
+        
+        user_stats = {
+            "total_interactions": len(user_interactions),
+            "total_score": sum(i.score for i in user_interactions),
+            "unique_coupons": len(set(i.coupon_id for i in user_interactions)),
+            "last_interaction": max([i.timestamp for i in user_interactions]).isoformat() if user_interactions else None,
+            "actions_breakdown": {
+                "searches": len([i for i in user_interactions if i.action == 'search']),
+                "clicks": len([i for i in user_interactions if i.action == 'click']),
+                "purchases": len([i for i in user_interactions if i.action == 'purchase'])
+            }
+        }
         
         return {
             "user_id": user_id,
-            "coupon_ids": recommendations_data["recommendations"],
-            "count": len(recommendations_data["recommendations"]),
-            "method": recommendations_data.get("method", "smart_rerank"),
+            "user_exists": True,
+            "user_stats": user_stats,
+            "recommendations": {
+                "coupon_ids": recommendations_data["recommendations"],
+                "count": len(recommendations_data["recommendations"]),
+                "method": recommendations_data.get("method", "smart_rerank"),
+                "user_categories": recommendations_data.get("user_categories", {}),
+                "rerank_stats": recommendations_data.get("rerank_stats", {})
+            },
             "timestamp": datetime.now().isoformat()
         }
         
+    except HTTPException:
+        # Re-raise HTTP exceptions (like 404 for user not found)
+        raise
     except Exception as e:
         logger.error(f"Error getting coupon IDs for user {user_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to get recommendations: {str(e)}")
+
+# Add a new endpoint to check if user exists
+@app.get("/user/{user_id}/exists")
+def check_user_exists(user_id: int, db: Session = Depends(get_db)):
+    """فحص إذا المستخدم موجود في النظام"""
+    
+    user_interactions = db.query(UserInteraction).filter(
+        UserInteraction.user_id == user_id
+    ).all()
+    
+    if not user_interactions:
+        return {
+            "user_id": user_id,
+            "exists": False,
+            "message": "User not found in the system",
+            "suggestion": "This user has no recorded interactions"
+        }
+    
+    user_stats = {
+        "total_interactions": len(user_interactions),
+        "total_score": sum(i.score for i in user_interactions),
+        "unique_coupons": len(set(i.coupon_id for i in user_interactions)),
+        "first_interaction": min([i.timestamp for i in user_interactions]).isoformat(),
+        "last_interaction": max([i.timestamp for i in user_interactions]).isoformat(),
+        "actions_breakdown": {
+            "searches": len([i for i in user_interactions if i.action == 'search']),
+            "clicks": len([i for i in user_interactions if i.action == 'click']),
+            "purchases": len([i for i in user_interactions if i.action == 'purchase'])
+        }
+    }
+    
+    return {
+        "user_id": user_id,
+        "exists": True,
+        "user_stats": user_stats,
+        "message": "User found in the system"
+    }
+
+# Add endpoint to get list of valid users
+@app.get("/users/active")
+def get_active_users(limit: int = 50, min_interactions: int = 1, db: Session = Depends(get_db)):
+    """الحصول على قائمة بالمستخدمين النشطين"""
+    
+    active_users = db.query(
+        UserInteraction.user_id,
+        func.count(UserInteraction.id).label('interaction_count'),
+        func.sum(UserInteraction.score).label('total_score'),
+        func.max(UserInteraction.timestamp).label('last_interaction')
+    ).group_by(UserInteraction.user_id)\
+     .having(func.count(UserInteraction.id) >= min_interactions)\
+     .order_by(func.count(UserInteraction.id).desc())\
+     .limit(limit).all()
+    
+    users_list = []
+    for user in active_users:
+        users_list.append({
+            "user_id": user.user_id,
+            "interaction_count": user.interaction_count,
+            "total_score": float(user.total_score),
+            "last_interaction": user.last_interaction.isoformat()
+        })
+    
+    return {
+        "active_users": users_list,
+        "total_count": len(users_list),
+        "filter_criteria": {
+            "min_interactions": min_interactions,
+            "limit": limit
+        },
+        "timestamp": datetime.now().isoformat()
+    }
 
 @app.get("/get_recommendations")
 def get_recommendations(user_id: int, top_n: int = 10, db: Session = Depends(get_db)):
