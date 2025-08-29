@@ -50,10 +50,23 @@ async def startup_event():
     
     try:
         logger.info("📥 Loading sentence transformer model...")
+        logger.info(f"Model name: {config.MODEL_NAME}")
+        logger.info(f"Expected vector dimension: {vector_dim}")
+        
+        # Try to load model with timeout and better error handling
         model = SentenceTransformer(config.MODEL_NAME)
-        logger.info("✅ Model loaded successfully!")
+        
+        # Test the model
+        test_embedding = model.encode(["test"])
+        logger.info(f"✅ Model loaded successfully! Test embedding shape: {test_embedding.shape}")
+        
+        if test_embedding.shape[1] != vector_dim:
+            logger.warning(f"⚠️ Vector dimension mismatch: expected {vector_dim}, got {test_embedding.shape[1]}")
+            
     except Exception as e:
         logger.error(f"❌ Model loading failed: {e}")
+        logger.error("💡 You can try loading the model manually using POST /load_model")
+        model = None
     
     logger.info("✅ Service started")
 
@@ -1030,6 +1043,40 @@ async def test_rabbitmq_send():
         return {
             "status": "error",
             "message": f"Failed to send test message: {str(e)}"
+        }
+
+@app.post("/load_model")
+def load_model():
+    """Manually load the sentence transformer model"""
+    global model
+    
+    try:
+        logger.info("🔄 Manually loading sentence transformer model...")
+        logger.info(f"Model name: {config.MODEL_NAME}")
+        
+        # Try to load the model
+        model = SentenceTransformer(config.MODEL_NAME)
+        
+        # Test the model with a simple encoding
+        test_text = "test sentence"
+        test_embedding = model.encode([test_text])
+        logger.info(f"✅ Model loaded successfully! Test embedding shape: {test_embedding.shape}")
+        
+        return {
+            "status": "success",
+            "message": "Model loaded successfully",
+            "model_name": config.MODEL_NAME,
+            "test_embedding_shape": test_embedding.shape,
+            "vector_dim": vector_dim
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Model loading failed: {str(e)}")
+        return {
+            "status": "error",
+            "message": f"Model loading failed: {str(e)}",
+            "model_name": config.MODEL_NAME,
+            "suggestion": "Check internet connectivity and available memory"
         }
 
 if __name__ == "__main__":

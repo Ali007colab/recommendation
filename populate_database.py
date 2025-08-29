@@ -275,15 +275,15 @@ def clear_existing_data():
         cur.execute("ALTER SEQUENCE user_interactions_id_seq RESTART WITH 1")
         cur.execute("SELECT setval('categories_id_seq', 10)")
         cur.execute("SELECT setval('coupon_types_id_seq', 10)")
-        
-        conn.commit()
+    
+    conn.commit()
         print("✅ Existing data cleared successfully")
     except Exception as e:
         print(f"❌ Error clearing data: {e}")
         conn.rollback()
     finally:
         cur.close()
-        conn.close()
+    conn.close()
 
 def populate_categories_and_types():
     """إضافة 100 فئة و 100 نوع كوبون"""
@@ -303,15 +303,15 @@ def populate_categories_and_types():
             description = f"Advanced {coupon_type.lower()} offer with special terms and conditions"
             cur.execute("INSERT INTO coupon_types (id, name, description) VALUES (%s, %s, %s) ON CONFLICT (id) DO NOTHING", 
                        (i, coupon_type, description))
-        
-        conn.commit()
+    
+    conn.commit()
         print("✅ Categories and coupon types added successfully")
     except Exception as e:
         print(f"❌ Error adding categories/types: {e}")
         conn.rollback()
     finally:
         cur.close()
-        conn.close()
+    conn.close()
 
 def populate_coupons(num_coupons=1000):
     """إضافة 1000 كوبون بطريقة مدروسة"""
@@ -368,8 +368,8 @@ def populate_coupons(num_coupons=1000):
                 # توليد الاسم والوصف
                 name = generate_smart_coupon_name(category_name, coupon_type_name)
                 description = generate_detailed_description(name, category_name, coupon_type_name, price)
-                coupon_code = generate_coupon_code()
-                
+        coupon_code = generate_coupon_code()
+        
                 # تاريخ انتهاء متنوع
                 end_date = datetime.now() + timedelta(days=random.randint(30, 730))  # من شهر إلى سنتين
                 
@@ -378,14 +378,14 @@ def populate_coupons(num_coupons=1000):
                 
                 cur.execute("""
                     INSERT INTO coupons (name, description, price, coupon_type_id, category_id, 
-                                       provider_id, coupon_status, coupon_code, date)
+             provider_id, coupon_status, coupon_code, date) 
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """, (name, description, price, coupon_type_id, category_id, 
                       provider_id, 1, coupon_code, end_date.date()))
                 
                 coupon_id += 1
         
-        conn.commit()
+            conn.commit()
         print(f"✅ Added {num_coupons} coupons successfully")
     except Exception as e:
         print(f"❌ Error adding coupons: {e}")
@@ -608,7 +608,7 @@ def populate_interactions(num_interactions=60000):
                 VALUES (%s, %s, %s, %s, %s)
             """, batch_data)
             conn.commit()
-        
+    
         print(f"✅ Added {interactions_added} interactions successfully")
     except Exception as e:
         print(f"❌ Error adding interactions: {e}")
@@ -687,7 +687,7 @@ def create_test_scenarios():
                     VALUES (%s, %s, %s, %s, %s)
                 """, (test_user_diverse, coupon_id, action, score, datetime.now() - timedelta(days=random.randint(1, 30))))
         
-        conn.commit()
+    conn.commit()
         print("✅ Advanced test scenarios created")
         print("  🔬 Test User 9999: Tech enthusiast with research pattern")
         print("  🔬 Test User 9998: Food lover with impulse buying")
@@ -698,7 +698,7 @@ def create_test_scenarios():
         conn.rollback()
     finally:
         cur.close()
-        conn.close()
+    conn.close()
 
 def print_advanced_statistics():
     """طباعة إحصائيات متقدمة ومفصلة"""
@@ -731,9 +731,9 @@ def print_advanced_statistics():
             SELECT action, COUNT(*) as count, AVG(score) as avg_score
             FROM user_interactions 
             GROUP BY action 
-            ORDER BY count DESC
-        """)
-        
+        ORDER BY count DESC
+    """)
+    
         print(f"\n📈 Interaction Statistics:")
         total_interactions = 0
         for row in cur.fetchall():
@@ -798,7 +798,7 @@ def print_advanced_statistics():
             JOIN coupons co ON ui.coupon_id = co.id
             JOIN categories c ON co.category_id = c.id
             GROUP BY c.name
-            ORDER BY interactions DESC
+        ORDER BY interactions DESC
             LIMIT 10
         """)
         
@@ -846,7 +846,7 @@ def print_advanced_statistics():
         print(f"❌ Error generating statistics: {e}")
     finally:
         cur.close()
-        conn.close()
+    conn.close()
 
 def main():
     """الدالة الرئيسية"""
