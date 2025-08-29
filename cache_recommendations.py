@@ -150,6 +150,46 @@ class RecommendationCacheManager:
             logger.error(f"❌ Error building vector store: {e}")
             return False
     
+    def get_all_users_with_interactions(self):
+        """الحصول على كل المستخدمين اللي عندهم تفاعلات (بدون حد أدنى)"""
+        db = SessionLocal()
+        try:
+            # Get ALL users with ANY interactions
+            all_users = db.query(
+                UserInteraction.user_id,
+                func.count(UserInteraction.id).label('interaction_count')
+            ).group_by(UserInteraction.user_id)\
+             .order_by(func.count(UserInteraction.id).desc())\
+             .all()
+            
+            logger.info(f"📊 Found {len(all_users)} total users with interactions")
+            
+            # Log distribution
+            if all_users:
+                max_interactions = all_users[0].interaction_count
+                min_interactions = all_users[-1].interaction_count
+                avg_interactions = sum(u.interaction_count for u in all_users) / len(all_users)
+                
+                logger.info(f"   📈 Interactions range: {min_interactions} - {max_interactions}")
+                logger.info(f"   📊 Average interactions: {avg_interactions:.1f}")
+                
+                # Show distribution
+                high_activity = len([u for u in all_users if u.interaction_count >= 10])
+                medium_activity = len([u for u in all_users if 5 <= u.interaction_count < 10])
+                low_activity = len([u for u in all_users if u.interaction_count < 5])
+                
+                logger.info(f"   🔥 High activity (10+): {high_activity} users")
+                logger.info(f"   🔶 Medium activity (5-9): {medium_activity} users")
+                logger.info(f"   🔸 Low activity (1-4): {low_activity} users")
+            
+            return [user.user_id for user in all_users]
+            
+        except Exception as e:
+            logger.error(f"Error getting users: {e}")
+            return []
+        finally:
+            db.close()
+    
     def get_user_recommendations(self, user_id: int, top_n: int = 10):
         """الحصول على توصيات المستخدم"""
         if not self.faiss_index or not self.model:
@@ -164,6 +204,7 @@ class RecommendationCacheManager:
             ).all()
             
             if not interactions:
+                logger.warning(f"⚠️ No interactions found for user {user_id}")
                 # Return popular coupons for new users
                 popular_coupons = db.query(
                     UserInteraction.coupon_id, 
@@ -178,6 +219,8 @@ class RecommendationCacheManager:
                     "user_categories": {},
                     "interaction_count": 0
                 }
+            
+            logger.info(f"📊 Processing user {user_id} with {len(interactions)} interactions")
             
             # Build user profile
             weighted_emb = np.zeros(self.vector_dim)
@@ -276,6 +319,8 @@ class RecommendationCacheManager:
                     if coupon_id not in recommendations and coupon_id not in seen_coupons:
                         recommendations.append(coupon_id)
             
+            logger.info(f"✅ Generated {len(recommendations)} recommendations for user {user_id}")
+            
             return {
                 "coupon_ids": recommendations[:top_n],
                 "method": "smart_content_based",
@@ -292,6 +337,7 @@ class RecommendationCacheManager:
     def cache_user_recommendations(self, user_id: int, recommendations: Dict):
         """حفظ توصيات المستخدم في Redis"""
         if not self.redis_client:
+            logger.error(f"❌ Redis not available for user {user_id}")
             return False
         
         try:
@@ -313,45 +359,29 @@ class RecommendationCacheManager:
                 json.dumps(cache_data, ensure_ascii=False)
             )
             
+            logger.info(f"💾 Cached user {user_id}: {len(recommendations['coupon_ids'])} coupons")
             return True
             
         except Exception as e:
             logger.error(f"Error caching user {user_id}: {e}")
             return False
     
-    def get_active_users(self, min_interactions: int = 5, limit: int = 1000):
-        """الحصول على المستخدمين النشطين"""
-        db = SessionLocal()
-        try:
-            active_users = db.query(
-                UserInteraction.user_id,
-                func.count(UserInteraction.id).label('interaction_count')
-            ).group_by(UserInteraction.user_id)\
-             .having(func.count(UserInteraction.id) >= min_interactions)\
-             .order_by(func.count(UserInteraction.id).desc())\
-             .limit(limit).all()
-            
-            return [user.user_id for user in active_users]
-            
-        finally:
-            db.close()
-    
-    def cache_all_users(self, min_interactions: int = 5, max_users: int = 1000, top_n: int = 10):
-        """تخزين توصيات كل المستخدمين النشطين"""
-        logger.info(f"🚀 Starting bulk caching process...")
+    def cache_all_users(self, top_n: int = 15):
+        """تخزين توصيات كل المستخدمين (بدون حد أدنى للتفاعلات)"""
+        logger.info(f"🚀 Starting COMPLETE bulk caching process...")
         
         # Update model and vector store first
         if not self.build_vector_store():
             logger.error("❌ Failed to build vector store")
             return False
         
-        # Get active users
-        user_ids = self.get_active_users(min_interactions, max_users)
+        # Get ALL users with interactions
+        user_ids = self.get_all_users_with_interactions()
         if not user_ids:
-            logger.warning("⚠️ No active users found")
+            logger.warning("⚠️ No users found with interactions")
             return False
         
-        logger.info(f"📊 Found {len(user_ids)} active users to process")
+        logger.info(f"📊 Processing ALL {len(user_ids)} users...")
         
         cached_count = 0
         failed_count = 0
@@ -359,103 +389,69 @@ class RecommendationCacheManager:
         
         for i, user_id in enumerate(user_ids):
             try:
+                logger.info(f"🔄 Processing user {user_id} ({i+1}/{len(user_ids)})")
+                
                 # Get recommendations
                 recommendations = self.get_user_recommendations(user_id, top_n)
                 if not recommendations:
+                    logger.warning(f"⚠️ No recommendations for user {user_id}")
                     failed_count += 1
                     continue
                 
                 # Cache recommendations
                 if self.cache_user_recommendations(user_id, recommendations):
                     cached_count += 1
+                    logger.info(f"✅ User {user_id} cached successfully")
                 else:
+                    logger.error(f"❌ Failed to cache user {user_id}")
                     failed_count += 1
                 
-                # Progress logging
-                if (i + 1) % 50 == 0:
+                # Progress logging every 10 users
+                if (i + 1) % 10 == 0:
                     elapsed = datetime.now() - start_time
                     rate = (i + 1) / elapsed.total_seconds()
                     eta = timedelta(seconds=(len(user_ids) - i - 1) / rate) if rate > 0 else "Unknown"
                     
                     logger.info(f"📈 Progress: {i + 1}/{len(user_ids)} ({((i + 1)/len(user_ids)*100):.1f}%) "
                               f"- Rate: {rate:.1f} users/sec - ETA: {eta}")
+                    logger.info(f"   ✅ Cached: {cached_count}, ❌ Failed: {failed_count}")
                 
             except Exception as e:
-                logger.error(f"Error processing user {user_id}: {e}")
+                logger.error(f"❌ Error processing user {user_id}: {e}")
                 failed_count += 1
                 continue
         
         duration = datetime.now() - start_time
         self.last_cache_update = datetime.now()
         
-        logger.info(f"✅ Bulk caching completed!")
-        logger.info(f"   📊 Total users: {len(user_ids)}")
+        logger.info(f"🎉 COMPLETE bulk caching finished!")
+        logger.info(f"   📊 Total users processed: {len(user_ids)}")
         logger.info(f"   ✅ Successfully cached: {cached_count}")
         logger.info(f"   ❌ Failed: {failed_count}")
         logger.info(f"   ⏱️ Duration: {duration}")
         logger.info(f"   🚀 Rate: {len(user_ids)/duration.total_seconds():.2f} users/sec")
         
-        return True
-    
-    def get_cache_stats(self):
-        """إحصائيات الـ Cache"""
-        if not self.redis_client:
-            return {"status": "redis_disconnected"}
-        
-        try:
-            # Get all cached users
-            pattern = "rec:user:*"
-            keys = self.redis_client.keys(pattern)
-            
-            # Sample some cached data
-            sample_data = []
-            for key in keys[:5]:
-                try:
-                    data = json.loads(self.redis_client.get(key))
-                    sample_data.append({
-                        "user_id": data["user_id"],
-                        "coupon_count": len(data["coupon_ids"]),
-                        "method": data["method"],
-                        "cached_at": data["cached_at"]
-                    })
-                except:
-                    continue
-            
-            return {
-                "status": "connected",
-                "total_cached_users": len(keys),
-                "last_model_update": self.last_model_update.isoformat() if self.last_model_update else None,
-                "last_cache_update": self.last_cache_update.isoformat() if self.last_cache_update else None,
-                "sample_cached_users": sample_data,
-                "cache_ttl_hours": config.RECOMMENDATIONS_CACHE_TTL // 3600
-            }
-            
-        except Exception as e:
-            return {"status": "error", "error": str(e)}
-    
-    def run_scheduled_update(self):
-        """تشغيل التحديث المجدول"""
-        logger.info("⏰ Running scheduled cache update...")
-        success = self.cache_all_users(min_interactions=3, max_users=2000, top_n=15)
-        
-        if success:
-            logger.info("✅ Scheduled update completed successfully")
-        else:
-            logger.error("❌ Scheduled update failed")
+        return cached_count > 0
 
 def main():
     """الدالة الرئيسية"""
-    logger.info("🚀 Starting Recommendation Cache Manager")
+    logger.info("🚀 Starting COMPLETE Recommendation Cache Manager")
     
     # Initialize cache manager
     cache_manager = RecommendationCacheManager()
     
-    # Run initial caching
-    logger.info("🔄 Running initial cache population...")
-    cache_manager.cache_all_users(min_interactions=3, max_users=1500, top_n=15)
+    # Run complete caching for ALL users
+    logger.info("🔄 Running COMPLETE cache population for ALL users...")
+    success = cache_manager.cache_all_users(top_n=15)
     
-    # Schedule regular updates
-    schedule.every(2).hours.do(cache_manager.run_scheduled_update)
+    if success:
+        logger.info("✅ Initial caching completed successfully")
+    else:
+        logger.error("❌ Initial caching failed")
+        return
+    
+    # Schedule regular updates every 2 hours
+    schedule.every(2).hours.do(lambda: cache_manager.cache_all_users(top_n=15))
     
     logger.info("⏰ Scheduled updates every 2 hours")
     logger.info("🔄 Cache manager is running...")
