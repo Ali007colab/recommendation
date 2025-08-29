@@ -3,15 +3,29 @@
 import logging
 import sys
 import os
-from fastapi import FastAPI, Depends, HTTPException
+import asyncio
+import threading
+from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 import numpy as np
 from sentence_transformers import SentenceTransformer
 import faiss
-from datetime import datetime
-from collections import defaultdict
 from datetime import datetime, timedelta
+from collections import defaultdict
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.interval import IntervalTrigger
+import atexit
+
+# Set cache directories before importing sentence_transformers
+os.environ['TRANSFORMERS_CACHE'] = '/tmp/transformers_cache'
+os.environ['HF_HOME'] = '/tmp/huggingface_cache'
+os.environ['TORCH_HOME'] = '/tmp/torch_cache'
+
+# Create cache directories if they don't exist
+cache_dirs = ['/tmp/transformers_cache', '/tmp/huggingface_cache', '/tmp/torch_cache']
+for cache_dir in cache_dirs:
+    os.makedirs(cache_dir, exist_ok=True)
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
@@ -23,10 +37,13 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Recommendation Service", version="1.0.0")
 
+# Global variables
 model = None
 faiss_index = None
 coupon_ids = []
 vector_dim = config.VECTOR_DIM
+last_vector_build = None
+scheduler = None
 
 def build_enhanced_text(coupon, category, coupon_type):
     category_tokens = f"CATEGORY_{category.name} " * 25 if category else ''
@@ -37,9 +54,114 @@ def build_enhanced_text(coupon, category, coupon_type):
     
     return f"{category_tokens}{type_tokens}{name_emphasis} {description_reduced} {price_range}"
 
+def ensure_model_loaded():
+    """ضمان تحميل المودل وإعادة تحميله إذا لزم الأمر"""
+    global model
+    
+    if model is None:
+        try:
+            logger.info("🔄 Loading sentence transformer model...")
+            model = SentenceTransformer(config.MODEL_NAME)
+            
+            # Test the model
+            test_embedding = model.encode(["test sentence"])
+            logger.info(f"✅ Model loaded successfully! Test embedding shape: {test_embedding.shape}")
+            
+            return True
+        except Exception as e:
+            logger.error(f"❌ Model loading failed: {e}")
+            model = None
+            return False
+    
+    return True
+
+def build_vector_store_background():
+    """بناء الـ Vector Store في الخلفية"""
+    global faiss_index, coupon_ids, last_vector_build
+    
+    try:
+        logger.info("🔨 Building vector store in background...")
+        
+        # Ensure model is loaded
+        if not ensure_model_loaded():
+            logger.error("❌ Cannot build vector store: Model not loaded")
+            return False
+        
+        # Get database session
+        from database import SessionLocal
+        db = SessionLocal()
+        
+        try:
+            coupons = db.query(Coupon).all()
+            if not coupons:
+                logger.warning("⚠️ No coupons found for vector store")
+                return False
+            
+            texts = []
+            new_coupon_ids = []
+            
+            for coupon in coupons:
+                category = db.query(Category).filter(Category.id == coupon.category_id).first()
+                coupon_type = db.query(CouponType).filter(CouponType.id == coupon.coupon_type_id).first()
+                text = build_enhanced_text(coupon, category, coupon_type)
+                texts.append(text)
+                new_coupon_ids.append(coupon.id)
+            
+            logger.info(f"📊 Encoding {len(texts)} texts...")
+            embeddings = model.encode(texts)
+            
+            logger.info("🏗️ Building FAISS index...")
+            new_faiss_index = faiss.IndexFlatIP(vector_dim)
+            new_faiss_index.add(embeddings.astype('float32'))
+            
+            # Update global variables atomically
+            faiss_index = new_faiss_index
+            coupon_ids = new_coupon_ids
+            last_vector_build = datetime.now()
+            
+            logger.info(f"✅ Vector store built successfully with {len(coupons)} coupons")
+            return True
+            
+        finally:
+            db.close()
+            
+    except Exception as e:
+        logger.error(f"❌ Error building vector store: {e}")
+        return False
+
+def start_scheduler():
+    """بدء الجدولة التلقائية"""
+    global scheduler
+    
+    scheduler = BackgroundScheduler()
+    
+    # بناء الـ Vector Store كل ساعتين
+    scheduler.add_job(
+        func=build_vector_store_background,
+        trigger=IntervalTrigger(hours=2),
+        id='build_vector_store',
+        name='Build Vector Store Every 2 Hours',
+        replace_existing=True
+    )
+    
+    # فحص المودل كل 30 دقيقة
+    scheduler.add_job(
+        func=ensure_model_loaded,
+        trigger=IntervalTrigger(minutes=30),
+        id='check_model',
+        name='Check Model Every 30 Minutes',
+        replace_existing=True
+    )
+    
+    scheduler.start()
+    logger.info("⏰ Scheduler started - Vector store will rebuild every 2 hours")
+    
+    # Ensure scheduler shuts down when the application exits
+    atexit.register(lambda: scheduler.shutdown())
+
 @app.on_event("startup")
 async def startup_event():
-    global model
+    global model, last_vector_build
     logger.info("🚀 Starting Recommendation Service...")
     
     try:
@@ -48,27 +170,25 @@ async def startup_event():
     except Exception as e:
         logger.error(f"❌ Database error: {e}")
     
-    try:
-        logger.info("📥 Loading sentence transformer model...")
-        logger.info(f"Model name: {config.MODEL_NAME}")
-        logger.info(f"Expected vector dimension: {vector_dim}")
-        
-        # Try to load model with timeout and better error handling
-        model = SentenceTransformer(config.MODEL_NAME)
-        
-        # Test the model
-        test_embedding = model.encode(["test"])
-        logger.info(f"✅ Model loaded successfully! Test embedding shape: {test_embedding.shape}")
-        
-        if test_embedding.shape[1] != vector_dim:
-            logger.warning(f"⚠️ Vector dimension mismatch: expected {vector_dim}, got {test_embedding.shape[1]}")
-            
-    except Exception as e:
-        logger.error(f"❌ Model loading failed: {e}")
-        logger.error("💡 You can try loading the model manually using POST /load_model")
-        model = None
+    # Load model with better error handling
+    if ensure_model_loaded():
+        # Build initial vector store
+        if build_vector_store_background():
+            logger.info("✅ Initial vector store built")
+        else:
+            logger.warning("⚠️ Initial vector store build failed")
     
-    logger.info("✅ Service started")
+    # Start the scheduler
+    start_scheduler()
+    
+    logger.info("✅ Service started with automatic vector store rebuilding")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    global scheduler
+    if scheduler:
+        scheduler.shutdown()
+        logger.info("⏰ Scheduler stopped")
 
 @app.get("/")
 def root():
@@ -77,7 +197,9 @@ def root():
         "version": "1.0.0",
         "status": "🟢 running",
         "model_loaded": "✅" if model else "❌",
-        "vector_store_built": "✅" if faiss_index else "❌"
+        "vector_store_built": "✅" if faiss_index else "❌",
+        "last_vector_build": last_vector_build.isoformat() if last_vector_build else "Never",
+        "next_rebuild": "Every 2 hours automatically"
     }
 
 @app.get("/health")
@@ -86,7 +208,9 @@ def health_check():
         "status": "healthy",
         "timestamp": datetime.utcnow(),
         "model_status": "loaded" if model else "not_loaded",
-        "vector_store_status": "built" if faiss_index is not None else "not_built"
+        "vector_store_status": "built" if faiss_index is not None else "not_built",
+        "last_vector_build": last_vector_build.isoformat() if last_vector_build else None,
+        "scheduler_running": scheduler.running if scheduler else False
     }
 
 @app.post("/build_vector_store")
@@ -121,6 +245,20 @@ def build_vector_store(db: Session = Depends(get_db)):
     
     logger.info(f"✅ Vector store built with {len(coupons)} coupons")
     return {"message": f"Vector store built with {len(coupons)} coupons"}
+
+@app.post("/force_rebuild_vector_store")
+def force_rebuild_vector_store():
+    """إجبار إعادة بناء الـ Vector Store فوراً"""
+    success = build_vector_store_background()
+    
+    if success:
+        return {
+            "message": "Vector store rebuilt successfully",
+            "timestamp": last_vector_build.isoformat(),
+            "coupon_count": len(coupon_ids)
+        }
+    else:
+        raise HTTPException(status_code=500, detail="Failed to rebuild vector store")
 
 @app.post("/log_event")
 def log_event(user_id: int, coupon_id: int, action: str, db: Session = Depends(get_db)):
@@ -1078,6 +1216,193 @@ def load_model():
             "model_name": config.MODEL_NAME,
             "suggestion": "Check internet connectivity and available memory"
         }
+
+@app.get("/user/{user_id}/recommended_coupons")
+def get_user_recommended_coupons(
+    user_id: int, 
+    top_n: int = 10, 
+    include_details: bool = True,
+    db: Session = Depends(get_db)
+):
+    """
+    الحصول على الكوبونات المقترحة لمستخدم محدد مع التفاصيل الكاملة
+    
+    Args:
+        user_id: معرف المستخدم
+        top_n: عدد التوصيات المطلوبة (افتراضي: 10)
+        include_details: تضمين تفاصيل الكوبونات (افتراضي: true)
+    
+    Returns:
+        قائمة بالكوبونات المقترحة مع تفاصيلها
+    """
+    
+    if faiss_index is None or model is None:
+        raise HTTPException(status_code=500, detail="System not ready - vector store not built")
+    
+    try:
+        # Get recommendations using the smart rerank method
+        recommendations_data = get_recommendations_smart_rerank(user_id, top_n, db)
+        recommended_coupon_ids = recommendations_data["recommendations"]
+        
+        if not include_details:
+            return {
+                "user_id": user_id,
+                "coupon_ids": recommended_coupon_ids,
+                "count": len(recommended_coupon_ids),
+                "method": recommendations_data.get("method", "smart_rerank"),
+                "timestamp": datetime.now().isoformat()
+            }
+        
+        # Get detailed coupon information
+        detailed_coupons = []
+        
+        for coupon_id in recommended_coupon_ids:
+            coupon = db.query(Coupon).filter(Coupon.id == coupon_id).first()
+            if not coupon:
+                continue
+                
+            category = db.query(Category).filter(Category.id == coupon.category_id).first()
+            coupon_type = db.query(CouponType).filter(CouponType.id == coupon.coupon_type_id).first()
+            
+            coupon_detail = {
+                "coupon_id": coupon.id,
+                "name": coupon.name,
+                "description": coupon.description,
+                "price": float(coupon.price),
+                "coupon_code": coupon.coupon_code,
+                "category": {
+                    "id": category.id if category else None,
+                    "name": category.name if category else "Unknown"
+                },
+                "coupon_type": {
+                    "id": coupon_type.id if coupon_type else None,
+                    "name": coupon_type.name if coupon_type else "Unknown"
+                },
+                "provider_id": coupon.provider_id,
+                "status": coupon.coupon_status,
+                "expiry_date": coupon.date.isoformat() if coupon.date else None
+            }
+            
+            detailed_coupons.append(coupon_detail)
+        
+        # Get user interaction summary
+        user_interactions = db.query(UserInteraction).filter(
+            UserInteraction.user_id == user_id
+        ).all()
+        
+        user_summary = {
+            "total_interactions": len(user_interactions),
+            "total_score": sum(i.score for i in user_interactions),
+            "unique_coupons_interacted": len(set(i.coupon_id for i in user_interactions)),
+            "last_interaction": max([i.timestamp for i in user_interactions]).isoformat() if user_interactions else None
+        }
+        
+        return {
+            "user_id": user_id,
+            "user_summary": user_summary,
+            "recommendations": {
+                "count": len(detailed_coupons),
+                "method": recommendations_data.get("method", "smart_rerank"),
+                "user_categories": recommendations_data.get("user_categories", {}),
+                "coupons": detailed_coupons
+            },
+            "rerank_stats": recommendations_data.get("rerank_stats", {}),
+            "timestamp": datetime.now().isoformat(),
+            "system_info": {
+                "last_vector_build": last_vector_build.isoformat() if last_vector_build else None,
+                "total_coupons_in_system": len(coupon_ids)
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Error getting recommendations for user {user_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get recommendations: {str(e)}")
+
+@app.get("/user/{user_id}/recommended_coupon_ids")
+def get_user_recommended_coupon_ids_only(
+    user_id: int, 
+    top_n: int = 10,
+    db: Session = Depends(get_db)
+):
+    """
+    الحصول على معرفات الكوبونات المقترحة فقط (استجابة سريعة)
+    
+    Args:
+        user_id: معرف المستخدم
+        top_n: عدد التوصيات المطلوبة
+    
+    Returns:
+        قائمة بمعرفات الكوبونات المقترحة فقط
+    """
+    
+    if faiss_index is None or model is None:
+        raise HTTPException(status_code=500, detail="System not ready")
+    
+    try:
+        recommendations_data = get_recommendations_smart_rerank(user_id, top_n, db)
+        
+        return {
+            "user_id": user_id,
+            "coupon_ids": recommendations_data["recommendations"],
+            "count": len(recommendations_data["recommendations"]),
+            "method": recommendations_data.get("method", "smart_rerank"),
+            "timestamp": datetime.now().isoformat()
+        }
+        
+    except Exception as e:
+        logger.error(f"Error getting coupon IDs for user {user_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get recommendations: {str(e)}")
+
+@app.get("/system/status")
+def get_system_status():
+    """فحص حالة النظام الشاملة"""
+    
+    # Get database stats
+    try:
+        from database import SessionLocal
+        db = SessionLocal()
+        
+        total_coupons = db.query(Coupon).count()
+        total_categories = db.query(Category).count()
+        total_interactions = db.query(UserInteraction).count()
+        unique_users = db.query(UserInteraction.user_id).distinct().count()
+        
+        db.close()
+        
+    except Exception as e:
+        logger.error(f"Error getting database stats: {e}")
+        total_coupons = total_categories = total_interactions = unique_users = 0
+    
+    return {
+        "service_status": "running",
+        "timestamp": datetime.now().isoformat(),
+        "model": {
+            "loaded": model is not None,
+            "name": config.MODEL_NAME,
+            "vector_dimension": vector_dim
+        },
+        "vector_store": {
+            "built": faiss_index is not None,
+            "coupon_count": len(coupon_ids),
+            "last_build": last_vector_build.isoformat() if last_vector_build else None,
+            "auto_rebuild": "Every 2 hours"
+        },
+        "scheduler": {
+            "running": scheduler.running if scheduler else False,
+            "jobs": len(scheduler.get_jobs()) if scheduler else 0
+        },
+        "database": {
+            "total_coupons": total_coupons,
+            "total_categories": total_categories,
+            "total_interactions": total_interactions,
+            "unique_users": unique_users
+        },
+        "cache_directories": {
+            "transformers_cache": "/tmp/transformers_cache",
+            "hf_cache": "/tmp/huggingface_cache",
+            "torch_cache": "/tmp/torch_cache"
+        }
+    }
 
 if __name__ == "__main__":
     import uvicorn
